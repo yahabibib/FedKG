@@ -1,0 +1,37 @@
+# ...existing code...
+# Python bytecode
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# cache
+.cache/
+cache/
+*/cache/
+
+# checkpoints / model weights
+checkpoints/
+**/checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# data folders
+data/
+**/data/
+datasets/
+raw_data/
+processed_data/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# temp / logs / envs
+tmp/
+temp/
+logs/
+*.log
+venv/
+env/
+.env
+# ...existing code...
