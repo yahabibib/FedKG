@@ -8,15 +8,24 @@
 
 ---
 
-## 🌟 核心特性 (Key Features)
+## 数据集来源 (Data Source)
+本项目默认配置使用 DBP15K (ZH-EN) 数据集进行实验。
 
-* **🛡️ 隐私保护联邦学习**: 数据不出本地，仅交换公共映射层的模型参数，保留私有图结构特征.
-* **⚓️ 语义锚点机制 (SBERT)**: 利用 SBERT 生成的文本嵌入作为冻结的“绝对坐标系”，引导异构图结构特征的对齐，无需人工标注种子对齐.
-* **🧩 解耦模型架构 (Decoupled Architecture)**:
+数据来源: DBP15K (Chinese-English)
+
+下载地址: [HuggingFace - MatchBench DBP15K](https://huggingface.co/datasets/matchbench/dbp15k-zh-en/tree/main)
+
+---
+
+## 核心特性 (Key Features)
+
+* **隐私保护联邦学习**: 数据不出本地，仅交换公共映射层的模型参数，保留私有图结构特征.
+* **语义锚点机制 (SBERT)**: 利用 SBERT 生成的文本嵌入作为冻结的“绝对坐标系”，引导异构图结构特征的对齐，无需人工标注种子对齐.
+* **解耦模型架构 (Decoupled Architecture)**:
     * **Private (私有层)**: GCN 编码器，适应本地特有的图拓扑结构，**不参与聚合**。
     * **Shared (公共层)**: MLP 投影层，学习统一的语义映射规则，**参与联邦聚合**。
-* **🔄 迭代自训练 (Iterative Self-Training)**: 基于互为最近邻 (RNN) 生成高置信度伪标签，动态更新锚点，逐步扩大对齐规模.
-* **🎯 安全困难负采样 (Safe Hard Mining)**: 自动挖掘难区分的负样本，提升模型判别能力.
+* **迭代自训练 (Iterative Self-Training)**: 基于互为最近邻 (RNN) 生成高置信度伪标签，动态更新锚点，逐步扩大对齐规模.
+* **安全困难负采样 (Safe Hard Mining)**: 自动挖掘难区分的负样本，提升模型判别能力.
 
 ---
 
