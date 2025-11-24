@@ -52,8 +52,8 @@ DATASET_CONFIGS = {
         'transe_dim': 300, 'transe_epochs': 1000, 'transe_batch': 2048,
         'gcn_dim': 300, 'gcn_hidden': 600, 'gcn_layers': 2,
         'fl_rounds': 100, 'fl_local_epochs': 5, 'fl_batch': 512, 'fl_lr': 5e-4,
-        'fl_margin': 0.4,  # 这里的 Margin 设置为 0.4 以增加难度
-        'gcn_dropout': 0.5,  # 增加 Dropout 防止过拟合
+        'fl_margin': 0.4,
+        'gcn_dropout': 0.5,
         'eval_k': [1, 10, 50]
     }
 }
@@ -83,21 +83,26 @@ FL_LR = _cfg['fl_lr']
 FL_MARGIN = _cfg['fl_margin']
 
 # --- 联邦原型对比学习 (Prototype Contrastive Learning) ---
-USE_PROTOTYPES = True    # 开关
-PROTO_NUM = 100          # 每个客户端生成的原型数量 (聚类中心数)
-PROTO_LAMBDA = 0.1       # 原型损失的权重 (不宜过大，作为辅助任务)
-PROTO_TEMPERATURE = 0.1  # 原型对比的温度系数
+USE_PROTOTYPES = True
+PROTO_NUM = 100
+PROTO_LAMBDA = 0.1
+PROTO_TEMPERATURE = 0.1
 
 EVAL_K_VALUES = _cfg['eval_k']
+
+# --- 🔥 [新增] 融合推理配置 ---
+# 0.42 是实验得出的最佳值 (42% GCN + 58% SBERT)
+EVAL_FUSION_ALPHA = 0.42
 
 if MODEL_ARCH == 'gcn':
     MODEL_INFO = f"GCN (Dim={GCN_DIM}, Hidden={GCN_HIDDEN}, Drop={GCN_DROPOUT})"
 elif MODEL_ARCH == 'projection':
     MODEL_INFO = f"TransE (Dim={TRANSE_DIM}) + MLP Projection"
 else:
-    MODEL_INFO = "Unknown"
+    MODEL_INFO = "Decoupled (GCN+MLP)"
 
 print(f"⚡️ 配置加载完毕: [{CURRENT_DATASET_NAME}]")
 print(f"   🕸️ 架构: {MODEL_INFO}")
 print(f"   🎲 模式: {'联邦聚合' if USE_AGGREGATION else '孤立训练'}")
+print(f"   ⚖️ 融合 Alpha: {EVAL_FUSION_ALPHA}")
 print("-" * 50)
