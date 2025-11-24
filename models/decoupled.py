@@ -1,37 +1,53 @@
-# 📄 AiStudy/models/decoupled.py
+# 📄 models/decoupled.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .gcn import GCNLayer  # 复用之前的 GCNLayer
+from .gcn import RelationGCNLayer  # <--- 升级导入 RelationGCNLayer
 
 
 class DecoupledModel(nn.Module):
     """
-    【解耦模型架构】
-    - struct_encoder (GCN): 私有层，负责提取本地结构特征 (不聚合)
-    - semantic_projector (MLP): 公共层，负责映射到语义空间 (聚合)
+    【关系感知解耦模型】
+    - struct_encoder (RelationGCN): 私有层，提取关系感知的结构特征
+    - semantic_projector (MLP): 公共层，映射到语义空间
     """
 
-    def __init__(self, num_entities, feature_dim, hidden_dim, output_dim, dropout=0.3):
+    def __init__(self, num_entities, num_relations, feature_dim, hidden_dim, output_dim, dropout=0.3):
         super().__init__()
 
-        print(f"    [Model Init] Decoupled: GCN(Private) -> MLP(Shared)")
+        # 注意：num_relations 是原始关系数，内部层会处理反向和自环，
+        # 但我们需要在这里维护 Relation Embeddings，因为它是结构编码器的一部分
+        total_rels = 2 * num_relations + 1
+
+        print(
+            f"    [Model Init] Decoupled (Relation-Aware): {num_entities} Ents, {total_rels} Rels")
 
         # --- 1. 私有结构编码器 (Private) ---
-        # 可学习的初始节点特征
+        # 初始节点特征
         self.initial_features = nn.Parameter(
             torch.randn(num_entities, feature_dim))
         nn.init.xavier_uniform_(self.initial_features)
 
-        # GCN 层 (只负责提取结构，不负责对齐)
+        # 初始关系特征 (私有参数)
+        self.relation_embeddings = nn.Parameter(
+            torch.randn(total_rels, feature_dim))
+        nn.init.xavier_uniform_(self.relation_embeddings)
+
+        # 使用 RelationGCNLayer 替代原来的 GCNLayer
         self.struct_encoder = nn.ModuleList([
-            GCNLayer(feature_dim, hidden_dim),
+            RelationGCNLayer(feature_dim, hidden_dim),
             # 可以加更多层，这里保持双层结构
+            # 第二层输入 hidden, 输出 hidden (因为最后还要过 MLP)
+            # 或者像 GCN 那样第二层直接输出 output_dim?
+            # 这里的 Decoupled 架构通常是 GCN 负责提取特征，MLP 负责对齐
+            # 所以我们让 GCN 输出 hidden_dim
         ])
 
+        # 为了加深网络，可以加一个层间激活
+        self.activation = nn.ReLU()
+
         # --- 2. 公共语义映射器 (Shared) ---
-        # 这是一个 MLP，负责把结构特征翻译成 SBERT 语义
-        # 它的输入是 GCN 的输出 (hidden_dim)，输出是 SBERT 维度 (output_dim)
+        # MLP: Hidden -> Output (SBERT Dim)
         self.semantic_projector = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
@@ -42,17 +58,29 @@ class DecoupledModel(nn.Module):
 
         self.dropout = dropout
 
-    def forward(self, adj):
+    def init_relation_embeddings(self, sbert_rel_emb):
+        """ 用 SBERT 初始化关系嵌入 """
+        with torch.no_grad():
+            count = 0
+            for rid, emb in sbert_rel_emb.items():
+                if rid < self.relation_embeddings.shape[0]:
+                    dim = min(self.relation_embeddings.shape[1], emb.shape[0])
+                    self.relation_embeddings.data[rid, :dim] = emb[:dim]
+                    count += 1
+            print(f"    [Decoupled] Initialized {count} relation embeddings.")
+
+    def forward(self, edge_index, edge_type):
         x = self.initial_features
 
-        # 1. 经过私有 GCN 编码
-        for layer in self.struct_encoder:
-            x = layer(x, adj)
-            x = F.relu(x)
-            x = F.dropout(x, self.dropout, training=self.training)
+        # 1. 经过私有 RelationGCN 编码
+        # 注意：现在需要传入 edge_index, edge_type, relation_embeddings
+        for i, layer in enumerate(self.struct_encoder):
+            x = layer(x, edge_index, edge_type, self.relation_embeddings)
+            if i < len(self.struct_encoder) - 1:  # 如果有多层
+                x = self.activation(x)
+                x = F.dropout(x, self.dropout, training=self.training)
 
         # 2. 经过公共 MLP 映射
-        # 注意：GCN 的输出经过 MLP 调整后，才去和 SBERT 做 Loss
         x = self.semantic_projector(x)
 
         return x

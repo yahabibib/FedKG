@@ -1,15 +1,15 @@
-# 📄 AiStudy/models/__init__.py
+# 📄 models/__init__.py
 from .transe import TransE
 from .projection import ProjectionModel
-from .gcn import GCN
-from .decoupled import DecoupledModel  # 新增
+from .gcn import RelationGCN  # <--- 修改这里：GCN -> RelationGCN
+from .decoupled import DecoupledModel
 
 # 模型注册表
 MODEL_REGISTRY = {
     'transe': TransE,
     'projection': ProjectionModel,
-    'gcn': GCN,
-    'decoupled': DecoupledModel  # 新增
+    'gcn': RelationGCN,       # <--- 修改这里
+    'decoupled': DecoupledModel
 }
 
 
