@@ -51,7 +51,7 @@ DATASET_CONFIGS = {
         'base_path': "/Users/yihanbin/Documents/科研/知识图谱/代码/KGE/FedKG/data/dbp15k/zh_en/",
         'transe_dim': 300, 'transe_epochs': 1000, 'transe_batch': 2048,
         'gcn_dim': 300, 'gcn_hidden': 600, 'gcn_layers': 2,
-        'fl_rounds': 100, 'fl_local_epochs': 5, 'fl_batch': 512, 'fl_lr': 5e-4,
+        'fl_rounds': 200, 'fl_local_epochs': 5, 'fl_batch': 512, 'fl_lr': 5e-4,
         'fl_margin': 0.4,
         'gcn_dropout': 0.5,
         'eval_k': [1, 10, 50]
@@ -101,8 +101,17 @@ elif MODEL_ARCH == 'projection':
 else:
     MODEL_INFO = "Decoupled (GCN+MLP)"
 
+# --- 🤖 [新增] 动态代理配置 (Dynamic Proxies) ---
+# 代理数量 (对应报告中的 K)
+PROXY_NUM = 128
+# 温度系数 (控制分布的平滑度，越小越尖锐)
+PROXY_TEMPERATURE = 0.001
+# 代理的学习率 (通常比模型参数大一点，因为它需要快速适应)
+PROXY_LR = 0.01
+
 print(f"⚡️ 配置加载完毕: [{CURRENT_DATASET_NAME}]")
 print(f"   🕸️ 架构: {MODEL_INFO}")
 print(f"   🎲 模式: {'联邦聚合' if USE_AGGREGATION else '孤立训练'}")
 print(f"   ⚖️ 融合 Alpha: {EVAL_FUSION_ALPHA}")
+print(f"   🤖 动态代理: K={PROXY_NUM}, Temp={PROXY_TEMPERATURE}")
 print("-" * 50)

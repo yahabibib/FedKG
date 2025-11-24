@@ -8,6 +8,9 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 import os  # 新增
 import config
+# 📄 precompute.py (在末尾添加)
+from sklearn.cluster import KMeans
+import numpy as np
 
 # --- 1. SBERT 嵌入生成 (带缓存) ---
 
@@ -118,3 +121,30 @@ def build_adjacency_matrix(triples, num_entities):
     print(f"  Built sparse adjacency matrix with {indices.shape[1]} edges.")
 
     return adj.coalesce()
+
+
+def initialize_proxies(sbert_dict, num_proxies=64):
+    """
+    使用 K-Means 初始化全局代理向量。
+    输入: sbert_dict {id: tensor}
+    输出: proxies_tensor [K, 768]
+    """
+    print(
+        f"\n[Precompute] Initializing {num_proxies} proxies using K-Means...")
+
+    # 1. 收集所有 SBERT 向量
+    embeddings = []
+    for eid, emb in sbert_dict.items():
+        embeddings.append(emb.numpy())
+
+    data = np.stack(embeddings)
+
+    # 2. 运行 K-Means
+    kmeans = KMeans(n_clusters=num_proxies, random_state=42, n_init=10)
+    kmeans.fit(data)
+
+    # 3. 获取中心点作为初始代理
+    centers = torch.tensor(kmeans.cluster_centers_, dtype=torch.float)
+
+    print(f"             > Proxies initialized. Shape: {centers.shape}")
+    return centers

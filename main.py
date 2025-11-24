@@ -67,10 +67,12 @@ def run_pipeline():
     writer = setup_infrastructure()
 
     logging.info(f"{'='*60}")
-    logging.info(f"🚀 启动联邦迭代自训练 (Fusion Optimized)")
+    logging.info(f"🚀 启动 FedAnchor++ (Dynamic Proxy Experiment)")
     logging.info(f"📚 数据集: {config.CURRENT_DATASET_NAME}")
     logging.info(f"🧠 模型架构: {config.MODEL_INFO}")
     logging.info(f"⚖️  融合权重: Alpha = {config.EVAL_FUSION_ALPHA}")
+    logging.info(
+        f"🤖 动态代理: K={config.PROXY_NUM}, Temp={config.PROXY_TEMPERATURE}")
     logging.info(f"{'='*60}")
 
     # --- 1. 数据加载 ---
@@ -118,6 +120,13 @@ def run_pipeline():
     sb_2 = precompute.get_bert_embeddings(
         ent_2, attr_2, "KG2", cache_file=cache_path_2)
 
+    # 🔥 [新增] K-Means 初始化代理
+    # 合并两个图谱的 SBERT 向量做聚类，保证代理覆盖全局语义空间
+    logging.info("--- 阶段 2.5: 初始化动态代理 ---")
+    all_sbert = {**sb_1, **sb_2}
+    current_proxies = precompute.initialize_proxies(
+        all_sbert, config.PROXY_NUM)
+
     adj_1, adj_2 = None, None
     if config.MODEL_ARCH in ['gcn', 'decoupled']:
         logging.info(f"[Mode: {config.MODEL_ARCH}] 构建邻接矩阵...")
@@ -126,7 +135,7 @@ def run_pipeline():
         adj_2 = precompute.build_adjacency_matrix(trip_2, num_ent_2)
 
     # --- 3. 联邦迭代训练 ---
-    logging.info("--- 阶段三：联邦迭代自训练 ---")
+    logging.info("--- 阶段三：联邦迭代自训练 (Dynamic Proxies) ---")
     ITERATIONS = 5
     pseudo_anchors_1 = {}
     pseudo_anchors_2 = {}
@@ -138,20 +147,21 @@ def run_pipeline():
         logging.info(f"🔄 Iteration {it+1}/{ITERATIONS}")
         logging.info(f"{'#'*40}")
 
-        server = fl_core.Server()
+        # 初始化 Server (传入当前最新的代理)
+        server = fl_core.Server(current_proxies)
 
-        c1_args = {'bert': sb_1, 'num_ent': num_ent_1}
-        c2_args = {'bert': sb_2, 'num_ent': num_ent_2}
+        c1_args = {'bert': sb_1, 'num_ent': num_ent_1, 'adj': adj_1}
+        c2_args = {'bert': sb_2, 'num_ent': num_ent_2, 'adj': adj_2}
 
-        if config.MODEL_ARCH in ['gcn', 'decoupled']:
-            c1_args['adj'] = adj_1
-            c2_args['adj'] = adj_2
-        else:
+        if config.MODEL_ARCH not in ['gcn', 'decoupled']:
             c1_args['transe'] = te_1
             c2_args['transe'] = te_2
 
-        c1 = fl_core.Client("C1", config.DEVICE, **c1_args)
-        c2 = fl_core.Client("C2", config.DEVICE, **c2_args)
+        # Client 初始化需要传入 proxies
+        c1 = fl_core.Client("C1", config.DEVICE,
+                            proxies=current_proxies, **c1_args)
+        c2 = fl_core.Client("C2", config.DEVICE,
+                            proxies=current_proxies, **c2_args)
 
         # --- 加载 Checkpoint ---
         if it > 0:
@@ -174,6 +184,9 @@ def run_pipeline():
                         server.global_model.load_state_dict(
                             filtered, strict=False)
 
+                    # 注意：代理状态通过 current_proxies 变量在内存中传递给下一轮 Server
+                    # 这里不需要额外加载代理文件，除非程序崩溃重启
+
                     if pseudo_anchors_1:
                         c1.update_anchors(pseudo_anchors_1)
                     if pseudo_anchors_2:
@@ -187,27 +200,43 @@ def run_pipeline():
         # --- 训练 ---
         global_w = server.get_global_model_state() if (
             it > 0 and config.USE_AGGREGATION) else None
+        global_p = server.get_global_proxies()  # 获取当前 Server 端的代理
+
         current_rounds = config.FL_ROUNDS if it == 0 else max(
             20, int(config.FL_ROUNDS * 0.5))
 
         try:
             for r in range(current_rounds):
-                w1, l1 = c1.local_train(
-                    global_w, config.FL_LOCAL_EPOCHS, config.FL_BATCH_SIZE, config.FL_LR)
-                w2, l2 = c2.local_train(
-                    global_w, config.FL_LOCAL_EPOCHS, config.FL_BATCH_SIZE, config.FL_LR)
+                # 传递 global_p (代理) 给客户端进行训练
+                # local_train 返回三个值: 模型权重, 代理权重, Loss
+                w1, p1, l1 = c1.local_train(
+                    global_w, global_p, config.FL_LOCAL_EPOCHS, config.FL_LR)
+                w2, p2, l2 = c2.local_train(
+                    global_w, global_p, config.FL_LOCAL_EPOCHS, config.FL_LR)
 
+                # 聚合 (同时聚合模型和代理)
                 if config.USE_AGGREGATION:
-                    global_w = server.aggregate_models([w1, w2])
+                    global_w, global_p, p_diff = server.aggregate(
+                        [w1, w2], [p1, p2])
+                else:
+                    p_diff = 0.0
 
+                # 记录日志
                 if ((r + 1) % 10 == 0) or (r == 0):
                     mode = "FedAvg" if config.USE_AGGREGATION else "Isolated"
                     logging.info(
-                        f"  Round {r+1}/{current_rounds} [{mode}] | Loss: {l1:.4f} / {l2:.4f}")
+                        f"  Round {r+1}/{current_rounds} [{mode}] | Loss: {l1:.4f} / {l2:.4f} | Proxy Shift: {p_diff:.6f}")
 
+                # TensorBoard 记录
                 writer.add_scalar(f'Loss/C1_Iter{it+1}', l1, r)
                 writer.add_scalar(f'Loss/C2_Iter{it+1}', l2, r)
+                writer.add_scalar(
+                    f'Proxy/Shift_Iter{it+1}', p_diff, r)  # 监控代理移动幅度
                 global_step += 1
+
+            # 本轮 Iteration 结束，更新 current_proxies 为训练后的结果，供下一轮使用
+            # 这样代理的进化就能延续到下一个阶段
+            current_proxies = global_p.detach().cpu()
 
         except RuntimeError as e:
             if "out of memory" in str(e):
@@ -275,6 +304,7 @@ def run_pipeline():
 
         logging.info("  [System] Cleaning up memory...")
         del server, c1, c2, global_w, w1, w2, emb_1, emb_2
+        # 注意：不要删 current_proxies
         gc.collect()
 
     logging.info("\n--- 实验结束 ---")
