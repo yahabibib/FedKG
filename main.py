@@ -136,17 +136,19 @@ def run_pipeline():
 
         server = fl_core.Server()
 
-        # 🔥 [关键] 组装 Client 参数
+        # 🔥 [修改] Client 初始化参数
+        # 关键：注释掉 rel_sbert，让模型自己学习关系门控参数
         c1_args = {
             'bert': sb_1, 'num_ent': num_ent_1,
             'num_rel': len(rel_1[0]),
-            'rel_sbert': rel_sb_1,
+            # 'rel_sbert': rel_sb_1,        <--- 保持注释
             'edge_index': edge_index_1, 'edge_type': edge_type_1
         }
+
         c2_args = {
             'bert': sb_2, 'num_ent': num_ent_2,
             'num_rel': len(rel_2[0]),
-            'rel_sbert': rel_sb_2,
+            # 'rel_sbert': rel_sb_2,        <--- 保持注释
             'edge_index': edge_index_2, 'edge_type': edge_type_2
         }
 
@@ -247,7 +249,10 @@ def run_pipeline():
 
         # --- 伪标签 ---
         if it < ITERATIONS - 1:
-            thresh = max(0.50, 0.80 - (it * 0.05))
+            # 🔥 [关键优化] 大幅降低门槛
+            # 第一轮 0.70，后面每轮降 0.05，最低 0.45
+            # 原来是 max(0.50, 0.80 - ...) 太高了
+            thresh = max(0.45, 0.70 - (it * 0.05))
             logging.info(
                 f"  🌱 Generating Pseudo-Labels (Threshold={thresh:.2f})...")
             new_pairs = generate_pseudo_pairs(emb_1, emb_2, threshold=thresh)

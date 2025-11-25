@@ -1,6 +1,6 @@
-# 📄 eval_fusion.py
-# 专门用于“双模融合”推理的独立脚本
-# 它可以加载训练好的 GCN 模型，并与 SBERT 进行加权融合，瞬间提升效果！
+# 📄 evaluate_fusion.py
+# 【最终适配版】支持 Relation-Aware GCN 的融合评估脚本
+# 它可以加载训练好的模型 (Checkpoint)，并测试不同 Alpha 下的融合效果
 
 import torch
 import torch.nn.functional as F
@@ -12,7 +12,7 @@ import fl_core
 from tqdm import tqdm
 
 # ==========================================
-# 🔧 融合评估的核心函数 (本地定义，无需修改 evaluate.py)
+# 🔧 融合评估的核心函数
 # ==========================================
 
 
@@ -22,15 +22,14 @@ def run_fusion_eval(test_pairs, gcn_emb_1, gcn_emb_2, sbert_emb_1, sbert_emb_2, 
     alpha: 融合权重。
            alpha=1.0 -> 纯 GCN
            alpha=0.0 -> 纯 SBERT
-           alpha=0.6 -> 推荐融合比例 (60% GCN + 40% SBERT)
+           alpha=0.5 -> 融合
     """
     print(f"\n⚡️ 开始融合评估 (Alpha = {alpha})")
     print(f"   说明: {int(alpha*100)}% 结构(GCN) + {int((1-alpha)*100)}% 语义(SBERT)")
 
     device = config.DEVICE
 
-    # 1. 准备 ID 列表
-    # 假设输入的 embedding 都是字典 {id: tensor}
+    # 1. 准备有效对
     valid_pairs = []
     kg1_ids, kg2_ids = set(), set()
 
@@ -62,11 +61,8 @@ def run_fusion_eval(test_pairs, gcn_emb_1, gcn_emb_2, sbert_emb_1, sbert_emb_2, 
 
     sim_sb = torch.mm(t_sb_1, t_sb_2.T)
 
-    # 4. 加权融合 (广播机制自动处理)
-    # final_sim = alpha * GCN + (1-alpha) * SBERT
+    # 4. 加权融合
     sim_final = (alpha * sim_gcn) + ((1.0 - alpha) * sim_sb)
-
-    # 移回 CPU 计算排名
     sim_final = sim_final.cpu()
 
     # 5. 计算指标
@@ -78,7 +74,6 @@ def run_fusion_eval(test_pairs, gcn_emb_1, gcn_emb_2, sbert_emb_1, sbert_emb_2, 
         target_idx2 = id2idx_2[i2]
 
         scores = sim_final[idx1]
-        # 获取排名的位置 (从0开始所以+1)
         rank = (torch.argsort(scores, descending=True)
                 == target_idx2).nonzero().item() + 1
 
@@ -100,22 +95,19 @@ def run_fusion_eval(test_pairs, gcn_emb_1, gcn_emb_2, sbert_emb_1, sbert_emb_2, 
 # ==========================================
 
 
-# ... (前面的 import 和 run_fusion_eval 函数保持不变) ...
-
-# ==========================================
-# 🚀 主流程 (修复版)
-# ==========================================
 def main():
-    print(f"🔥 启动双模融合脚本 (Ensemble Inference)")
+    print(f"🔥 启动双模融合脚本 (Relation-Aware Version)")
     print(f"💻 设备: {config.DEVICE}")
 
     # --- 1. 加载数据 ---
     print("\n[1/4] 加载基础数据...")
     ent_1 = data_loader.load_id_map(config.BASE_PATH + "ent_ids_1")
+    rel_1 = data_loader.load_id_map(config.BASE_PATH + "rel_ids_1")  # 需要关系ID
     trip_1 = data_loader.load_triples(config.BASE_PATH + "triples_1")
     num_ent_1 = max(list(ent_1[0].keys())) + 1
 
     ent_2 = data_loader.load_id_map(config.BASE_PATH + "ent_ids_2")
+    rel_2 = data_loader.load_id_map(config.BASE_PATH + "rel_ids_2")  # 需要关系ID
     trip_2 = data_loader.load_triples(config.BASE_PATH + "triples_2")
     num_ent_2 = max(list(ent_2[0].keys())) + 1
 
@@ -136,53 +128,52 @@ def main():
         return
 
     # --- 3. 准备 GCN 模型 (结构特征) ---
-    print("\n[3/4] 加载训练好的 GCN 模型...")
-    # ⚠️ 请确保这里的 TARGET_ITER 是你实际跑完的轮数
+    print("\n[3/4] 加载训练好的模型...")
+
+    # ⚠️ 请修改这里为你想要测试的 Iteration (通常是 5)
     TARGET_ITER = 5
     ckpt_c1 = f"checkpoints/c1_iter_{TARGET_ITER}.pth"
     ckpt_c2 = f"checkpoints/c2_iter_{TARGET_ITER}.pth"
 
     if not (os.path.exists(ckpt_c1) and os.path.exists(ckpt_c2)):
         print(f"   ❌ 找不到 Checkpoint 文件: {ckpt_c1}")
-        print("   请修改脚本中的 TARGET_ITER 为你实际拥有的轮次。")
+        print("   请修改脚本中的 TARGET_ITER。")
         return
 
-    # 构建邻接矩阵
-    print("   构建邻接矩阵 (如果比较大请稍等)...")
-
-    # 【关键修复】:
-    # MPS (Mac) 不支持稀疏张量，所以 adj 必须留在 CPU。
-    # CUDA (Nvidia) 支持，所以如果是 cuda 可以转过去。
-    adj_1 = precompute.build_adjacency_matrix(trip_1, num_ent_1)
-    adj_2 = precompute.build_adjacency_matrix(trip_2, num_ent_2)
-
-    if config.DEVICE.type == 'cuda':
-        adj_1 = adj_1.to(config.DEVICE)
-        adj_2 = adj_2.to(config.DEVICE)
-    else:
-        print("   [提示] 检测到非 CUDA 环境 (如 MPS/CPU)，邻接矩阵将保留在内存中以避免兼容性错误。")
+    # 🔥 [修改] 构建带关系的图结构 (Edge Index & Type)
+    print("   构建带关系的图结构...")
+    edge_index_1, edge_type_1 = precompute.build_graph_data(
+        trip_1, num_ent_1, len(rel_1[0]))
+    edge_index_2, edge_type_2 = precompute.build_graph_data(
+        trip_2, num_ent_2, len(rel_2[0]))
 
     # 初始化空模型
-    print("   初始化模型结构...")
+    print("   初始化模型结构 (Relation-Aware)...")
     config.MODEL_ARCH = 'decoupled'
 
-    # 注意：这里初始化 Client 时，adj 传进去是什么设备就是什么设备
-    c1 = fl_core.Client("C1_Eval", config.DEVICE, bert={
-                        0: torch.zeros(768)}, num_ent=num_ent_1, adj=adj_1)
+    # 初始化 Client (传入 edge_index, edge_type, num_rel)
+    # 注意：不需要传 rel_sbert，因为我们会加载 checkpoint 覆盖权重
+    c1 = fl_core.Client("C1_Eval", config.DEVICE,
+                        bert={0: torch.zeros(768)}, num_ent=num_ent_1,
+                        num_rel=len(rel_1[0]),  # 必须传
+                        edge_index=edge_index_1, edge_type=edge_type_1)
+
     c1.model.load_state_dict(torch.load(ckpt_c1, map_location=config.DEVICE))
     c1.model.eval()
 
-    c2 = fl_core.Client("C2_Eval", config.DEVICE, bert={
-                        0: torch.zeros(768)}, num_ent=num_ent_2, adj=adj_2)
+    c2 = fl_core.Client("C2_Eval", config.DEVICE,
+                        bert={0: torch.zeros(768)}, num_ent=num_ent_2,
+                        num_rel=len(rel_2[0]),  # 必须传
+                        edge_index=edge_index_2, edge_type=edge_type_2)
+
     c2.model.load_state_dict(torch.load(ckpt_c2, map_location=config.DEVICE))
     c2.model.eval()
 
     print("   ✅ 模型加载完毕！开始推理 GCN 特征...")
     with torch.no_grad():
-        # 获取 GCN 输出
-        # 模型内部的 GCNLayer 会自动处理 "MPS输入 + CPU矩阵" 的情况
-        out_1 = c1.model(adj_1).detach().cpu()
-        out_2 = c2.model(adj_2).detach().cpu()
+        # 🔥 [修改] 推理时传入 Edge Index 和 Type
+        out_1 = c1.model(c1.edge_index, c1.edge_type).detach().cpu()
+        out_2 = c2.model(c2.edge_index, c2.edge_type).detach().cpu()
 
         gcn_emb_1 = {i: out_1[i] for i in range(len(out_1))}
         gcn_emb_2 = {i: out_2[i] for i in range(len(out_2))}
@@ -191,12 +182,8 @@ def main():
     print("\n[4/4] 最终对决：不同 Alpha 的效果对比")
     print("=" * 60)
 
-    # 🎯 步长 0.01 的地毯式搜索
-    alphas_to_test = [
-        0.40, 0.41, 0.42, 0.43, 0.44,
-        0.45,
-        0.46, 0.47, 0.48, 0.49, 0.50
-    ]
+    # 建议扫描范围更广一点，因为模型变强了
+    alphas_to_test = [0.0, 1.0, 0.4, 0.5, 0.6, 0.7, 0.8]
 
     best_h1 = 0
     best_alpha = 0
