@@ -51,7 +51,7 @@ DATASET_CONFIGS = {
         'base_path': "/Users/yihanbin/Documents/科研/知识图谱/代码/KGE/FedKG/data/dbp15k/zh_en/",
         'transe_dim': 300, 'transe_epochs': 1000, 'transe_batch': 2048,
         'gcn_dim': 300, 'gcn_hidden': 300, 'gcn_layers': 2,
-        'fl_rounds': 100, 'fl_local_epochs': 5, 'fl_batch': 512, 'fl_lr': 5e-4,
+        'fl_rounds': 100, 'fl_local_epochs': 5, 'fl_batch': 512, 'fl_lr': 1e-4,
         'fl_margin': 0.4,
         'gcn_dropout': 0.2,
         'eval_k': [1, 10, 50]
