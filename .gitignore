@@ -22,6 +22,9 @@ data/
 datasets/
 raw_data/
 processed_data/
+figures/
+*.json
+runs/
 
 # Jupyter
 .ipynb_checkpoints/

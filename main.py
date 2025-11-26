@@ -1,5 +1,5 @@
 # 🚀 main.py
-# 【最终版】集成 TensorBoard、双模融合推理(Config配置)、健壮性检查
+# 【最终版】集成 TensorBoard、双模融合推理(Config配置)、自动化结果记录
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +13,18 @@ import evaluate
 import logging
 import datetime
 from torch.utils.tensorboard import SummaryWriter
+
+# --- 0. 基础设施设置 --- 之前加入这段：
+
+# --- 新增：引入结果记录器 ---
+try:
+    import utils_logger
+    HAS_LOGGER = True
+except ImportError:
+    HAS_LOGGER = False
+    print("⚠️ 警告: 未找到 utils_logger.py，实验结果将不会自动保存到 JSON。")
+
+# ----------------------------
 
 # --- 0. 基础设施设置 ---
 
@@ -127,11 +139,16 @@ def run_pipeline():
 
     # --- 3. 联邦迭代训练 ---
     logging.info("--- 阶段三：联邦迭代自训练 ---")
+    # 如果你要做消融实验，可以在这里把 ITERATIONS 改成 config 里的变量，或者硬编码
     ITERATIONS = 5
     pseudo_anchors_1 = {}
     pseudo_anchors_2 = {}
 
     global_step = 0
+
+    # 初始化变量以防循环未执行
+    final_hits = {}
+    final_mrr = 0.0
 
     for it in range(ITERATIONS):
         logging.info(f"\n{'#'*40}")
@@ -253,6 +270,10 @@ def run_pipeline():
                     config.EVAL_K_VALUES
                 )
 
+        # 更新最终结果变量
+        final_hits = hits
+        final_mrr = mrr
+
         if config.DEVICE.type == 'mps':
             torch.mps.empty_cache()
         elif config.DEVICE.type == 'cuda':
@@ -277,8 +298,42 @@ def run_pipeline():
         del server, c1, c2, global_w, w1, w2, emb_1, emb_2
         gc.collect()
 
+    # --- 4. 实验结束与记录 ---
     logging.info("\n--- 实验结束 ---")
     writer.close()
+
+    if HAS_LOGGER:
+        # 自动确定实验名称
+        if config.MODEL_ARCH == 'decoupled':
+            if config.USE_AGGREGATION:
+                exp_name = "FedKG (Proposed)"
+            else:
+                exp_name = "Isolation (Local)"
+        elif config.MODEL_ARCH == 'gcn':
+            if config.USE_AGGREGATION:
+                exp_name = "FedAvg (Full GCN)"
+            else:
+                exp_name = "Isolation (GCN)"
+        else:
+            exp_name = f"Experiment ({config.MODEL_ARCH})"
+
+        logging.info(f"📝 正在记录实验结果，名称: {exp_name}")
+
+        utils_logger.log_experiment_result(
+            exp_name=exp_name,
+            dataset=config.CURRENT_DATASET_NAME,
+            metrics={
+                "hits1": final_hits.get(1, 0),
+                "hits10": final_hits.get(10, 0),
+                "mrr": final_mrr
+            },
+            params={
+                "alpha": config.EVAL_FUSION_ALPHA,
+                "arch": config.MODEL_ARCH,
+                "aggregation": config.USE_AGGREGATION,
+                "iterations": ITERATIONS
+            }
+        )
 
 
 if __name__ == "__main__":
