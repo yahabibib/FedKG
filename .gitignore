@@ -12,6 +12,7 @@ cache/
 # checkpoints / model weights
 checkpoints/
 **/checkpoints/
+fine_tuned_models/
 *.ckpt
 *.pt
 *.pth

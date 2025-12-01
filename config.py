@@ -30,7 +30,11 @@ def get_best_device():
 
 DEVICE = get_best_device()
 
-BERT_MODEL_NAME = 'paraphrase-multilingual-mpnet-base-v2'
+# 【关键修复】必须使用完整的 HuggingFace 仓库 ID
+# 旧值: 'paraphrase-multilingual-mpnet-base-v2' (Transformers 库不识别)
+# 新值: 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2'
+BERT_MODEL_NAME = './fine_tuned_models/exp4_finetuned'
+
 BERT_DIM = 768
 BERT_BATCH_SIZE = 32
 
@@ -39,7 +43,6 @@ BERT_BATCH_SIZE = 32
 # =========================================================
 DATASET_CONFIGS = {
     'demo': {
-        # 请修改为您实际的 demo 路径
         'base_path': "/Users/yihanbin/Documents/科研/知识图谱/代码/KGE/FedKG/data/demo/",
         'transe_dim': 64, 'transe_epochs': 500, 'transe_batch': 8,
         'gcn_dim': 64, 'gcn_hidden': 128, 'gcn_layers': 2,
@@ -47,7 +50,7 @@ DATASET_CONFIGS = {
         'eval_k': [1, 5, 10]
     },
     'dbp15k': {
-        # 请修改为您实际的 dbp15k 路径
+        # 请确保路径正确
         'base_path': "/Users/yihanbin/Documents/科研/知识图谱/代码/KGE/FedKG/data/dbp15k/zh_en/",
         'transe_dim': 300, 'transe_epochs': 1000, 'transe_batch': 2048,
         'gcn_dim': 300, 'gcn_hidden': 600, 'gcn_layers': 2,
@@ -90,8 +93,7 @@ PROTO_TEMPERATURE = 0.1
 
 EVAL_K_VALUES = _cfg['eval_k']
 
-# --- 🔥 [新增] 融合推理配置 ---
-# 0.42 是实验得出的最佳值 (42% GCN + 58% SBERT)
+# --- 融合推理配置 ---
 EVAL_FUSION_ALPHA = 0.42
 
 if MODEL_ARCH == 'gcn':

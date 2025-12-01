@@ -1,10 +1,11 @@
-# 🚀 main.py
-# 【最终版】集成 TensorBoard、双模融合推理(Config配置)、自动化结果记录
+# 🚀 main.py (Final Optimized)
+# 1. SBERT 缓存修复
+# 2. GCN 训练轮次增加 (首轮 100 epoch)
+# 3. 最终模型保存
 
 import torch
 import torch.nn.functional as F
 import os
-import gc
 import config
 import data_loader
 import precompute
@@ -12,48 +13,32 @@ import fl_core
 import evaluate
 import logging
 import datetime
+import warnings
 from torch.utils.tensorboard import SummaryWriter
 
-# --- 0. 基础设施设置 --- 之前加入这段：
+warnings.filterwarnings("ignore")
 
-# --- 新增：引入结果记录器 ---
 try:
-    import utils_logger
+    import result_logger
     HAS_LOGGER = True
 except ImportError:
     HAS_LOGGER = False
-    print("⚠️ 警告: 未找到 utils_logger.py，实验结果将不会自动保存到 JSON。")
-
-# ----------------------------
-
-# --- 0. 基础设施设置 ---
 
 
 def setup_infrastructure():
-    for folder in ["checkpoints", "logs", "runs"]:
+    for folder in ["checkpoints", "logs", "runs", "cache"]:
         if not os.path.exists(folder):
             os.makedirs(folder)
-
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_filename = f"logs/exp_{config.CURRENT_DATASET_NAME}_{timestamp}.log"
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_filename, encoding='utf-8'),
-            logging.StreamHandler()
-        ]
-    )
-
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                        handlers=[logging.FileHandler(log_filename, encoding='utf-8'), logging.StreamHandler()])
     writer = SummaryWriter(
         log_dir=f"runs/{config.CURRENT_DATASET_NAME}_{timestamp}")
-    logging.info(f"📁 日志文件: {log_filename}")
     return writer
 
 
-def generate_pseudo_pairs(emb1, emb2, threshold=0.75):
-    """ 生成伪标签 (RNN 逻辑) """
+def generate_pseudo_pairs(emb1, emb2, valid_ids_1, valid_ids_2, threshold=0.75):
     emb1 = F.normalize(emb1, dim=1)
     emb2 = F.normalize(emb2, dim=1)
     sim_mat = torch.mm(emb1, emb2.T)
@@ -61,279 +46,179 @@ def generate_pseudo_pairs(emb1, emb2, threshold=0.75):
     values_2, indices_2 = torch.max(sim_mat, dim=0)
 
     pseudo_pairs = []
-    rnn_count = 0
+    valid_set_1 = set(valid_ids_1)
+    valid_set_2 = set(valid_ids_2)
+
     for i in range(len(emb1)):
+        if i not in valid_set_1:
+            continue
         j = indices_1[i].item()
+        if j not in valid_set_2:
+            continue
         if indices_2[j].item() == i:
-            rnn_count += 1
             if values_1[i].item() > threshold:
                 pseudo_pairs.append((i, j))
 
-    logging.info(f"     [Diagnosis] Total RNN pairs found: {rnn_count}")
     logging.info(
-        f"     [Diagnosis] Pairs passing threshold ({threshold:.2f}): {len(pseudo_pairs)}")
+        f"     [Mining] Clean pairs found: {len(pseudo_pairs)} (Threshold={threshold})")
     return pseudo_pairs
 
 
 def run_pipeline():
     writer = setup_infrastructure()
-
     logging.info(f"{'='*60}")
-    logging.info(f"🚀 启动联邦迭代自训练 (Fusion Optimized)")
-    logging.info(f"📚 数据集: {config.CURRENT_DATASET_NAME}")
-    logging.info(f"🧠 模型架构: {config.MODEL_INFO}")
-    logging.info(f"⚖️  融合权重: Alpha = {config.EVAL_FUSION_ALPHA}")
+    logging.info(f"🚀 启动 FedKG (Production Optimized)")
+    logging.info(f"   SBERT: {config.BERT_MODEL_NAME}")
     logging.info(f"{'='*60}")
 
-    # --- 1. 数据加载 ---
-    logging.info("--- 阶段一：数据加载 ---")
+    # 1. 加载数据
+    logging.info("📚 Loading Datasets...")
     ent_1 = data_loader.load_id_map(config.BASE_PATH + "ent_ids_1")
-    rel_1 = data_loader.load_id_map(config.BASE_PATH + "rel_ids_1")
     trip_1 = data_loader.load_triples(config.BASE_PATH + "triples_1")
-
-    pkl_1 = config.BASE_PATH + "description1.pkl"
-    attr_1 = data_loader.load_pickle_descriptions(pkl_1, ent_1) if os.path.exists(pkl_1) else \
-        data_loader.load_attribute_triples(
-            config.BASE_PATH + "zh_att_triples", ent_1)
+    rel_1, _ = data_loader.load_id_map(config.BASE_PATH + "rel_ids_1")
 
     ent_2 = data_loader.load_id_map(config.BASE_PATH + "ent_ids_2")
-    rel_2 = data_loader.load_id_map(config.BASE_PATH + "rel_ids_2")
     trip_2 = data_loader.load_triples(config.BASE_PATH + "triples_2")
+    rel_2, _ = data_loader.load_id_map(config.BASE_PATH + "rel_ids_2")
 
+    pkl_1 = config.BASE_PATH + "description1.pkl"
+    attr_1 = data_loader.load_pickle_descriptions(
+        pkl_1, ent_1) if os.path.exists(pkl_1) else {}
     pkl_2 = config.BASE_PATH + "description2.pkl"
-    attr_2 = data_loader.load_pickle_descriptions(pkl_2, ent_2) if os.path.exists(pkl_2) else \
-        data_loader.load_attribute_triples(
-            config.BASE_PATH + "en_att_triples", ent_2)
+    attr_2 = data_loader.load_pickle_descriptions(
+        pkl_2, ent_2) if os.path.exists(pkl_2) else {}
 
     test_pairs = data_loader.load_alignment_pairs(
         config.BASE_PATH + "ref_pairs")
     num_ent_1 = max(list(ent_1[0].keys())) + 1
     num_ent_2 = max(list(ent_2[0].keys())) + 1
+    num_rel_1 = max([t[1] for t in trip_1]) + 1
+    num_rel_2 = max([t[1] for t in trip_2]) + 1
 
-    # --- 2. 离线预计算 ---
-    logging.info("--- 阶段二：离线预计算 ---")
-    te_1, te_2 = None, None
-    if config.MODEL_ARCH == 'projection':
-        num_rel = max(len(rel_1[0]), len(rel_2[0]))
-        te_1 = precompute.train_transe(
-            trip_1, ent_1, num_ent_1, num_rel, "KG1")
-        te_2 = precompute.train_transe(
-            trip_2, ent_2, num_ent_2, num_rel, "KG2")
+    valid_ids_1 = list(ent_1[0].keys())
+    valid_ids_2 = list(ent_2[0].keys())
 
-    cache_path_1 = os.path.join("cache", "sbert_KG1.pt")
-    cache_path_2 = os.path.join("cache", "sbert_KG2.pt")
-    if not os.path.exists("cache"):
-        os.makedirs("cache")
+    # 2. 预计算 (Embeddings)
+    # 使用微调后的模型路径
+    current_bert_path = config.BERT_MODEL_NAME
+    logging.info(f"\n🔄 Computing Embeddings using: {current_bert_path}")
 
+    # 缓存文件 (确保文件名唯一，避免读取旧的)
+    cache_1 = "cache/sbert_KG1_exp4_final.pt"
+    cache_2 = "cache/sbert_KG2_exp4_final.pt"
+
+    # 计算实体 Embedding
+    # 这里不需要再拼结构了，因为模型已经微调过了，直接用描述即可
     sb_1 = precompute.get_bert_embeddings(
-        ent_1, attr_1, "KG1", cache_file=cache_path_1)
+        ent_1, attr_1, "KG1", cache_file=cache_1, custom_model_path=current_bert_path)
     sb_2 = precompute.get_bert_embeddings(
-        ent_2, attr_2, "KG2", cache_file=cache_path_2)
+        ent_2, attr_2, "KG2", cache_file=cache_2, custom_model_path=current_bert_path)
 
-    adj_1, adj_2 = None, None
-    if config.MODEL_ARCH in ['gcn', 'decoupled']:
-        logging.info(f"[Mode: {config.MODEL_ARCH}] 构建邻接矩阵...")
-        # 注意：MPS 无法处理稀疏矩阵，所以这里 adj 保持在 CPU
-        adj_1 = precompute.build_adjacency_matrix(trip_1, num_ent_1)
-        adj_2 = precompute.build_adjacency_matrix(trip_2, num_ent_2)
+    # 关系初始化 (可选)
+    rel_emb_1 = precompute.get_relation_embeddings(
+        rel_1, "KG1", cache_file="cache/rel_KG1_base.pt")
+    rel_emb_2 = precompute.get_relation_embeddings(
+        rel_2, "KG2", cache_file="cache/rel_KG2_base.pt")
 
-    # --- 3. 联邦迭代训练 ---
-    logging.info("--- 阶段三：联邦迭代自训练 ---")
-    # 如果你要做消融实验，可以在这里把 ITERATIONS 改成 config 里的变量，或者硬编码
+    adj_1 = precompute.build_adjacency_matrix(trip_1, num_ent_1)
+    adj_2 = precompute.build_adjacency_matrix(trip_2, num_ent_2)
+    if config.DEVICE.type == 'cuda':
+        adj_1 = adj_1.to(config.DEVICE)
+        adj_2 = adj_2.to(config.DEVICE)
+
+    # 评估 Baseline
+    logging.info("\n[Init] Evaluating SBERT Baseline...")
+    hits, _ = evaluate.evaluate_alignment(test_pairs, sb_1, sb_2, torch.nn.Identity(
+    ), torch.nn.Identity(), [1], sbert_1=sb_1, sbert_2=sb_2, alpha=0.0)
+    logging.info(f"   🏆 SBERT Baseline Hits@1: {hits[1]:.2f}%")
+
+    # 3. 联邦训练
+    logging.info("\n🔥 Starting GCN Training...")
+    server = fl_core.Server()
+    c1 = fl_core.Client("C1", config.DEVICE, bert=sb_1, num_ent=num_ent_1, adj=adj_1,
+                        triples=trip_1, num_relations=num_rel_1, rel_init_emb=rel_emb_1)
+    c2 = fl_core.Client("C2", config.DEVICE, bert=sb_2, num_ent=num_ent_2, adj=adj_2,
+                        triples=trip_2, num_relations=num_rel_2, rel_init_emb=rel_emb_2)
+
     ITERATIONS = 5
     pseudo_anchors_1 = {}
     pseudo_anchors_2 = {}
-
-    global_step = 0
-
-    # 初始化变量以防循环未执行
     final_hits = {}
-    final_mrr = 0.0
 
     for it in range(ITERATIONS):
-        logging.info(f"\n{'#'*40}")
-        logging.info(f"🔄 Iteration {it+1}/{ITERATIONS}")
-        logging.info(f"{'#'*40}")
+        logging.info(f"\n🔄 Iteration {it+1}/{ITERATIONS}")
 
-        server = fl_core.Server()
-
-        c1_args = {'bert': sb_1, 'num_ent': num_ent_1}
-        c2_args = {'bert': sb_2, 'num_ent': num_ent_2}
-
-        if config.MODEL_ARCH in ['gcn', 'decoupled']:
-            c1_args['adj'] = adj_1
-            c2_args['adj'] = adj_2
-        else:
-            c1_args['transe'] = te_1
-            c2_args['transe'] = te_2
-
-        c1 = fl_core.Client("C1", config.DEVICE, **c1_args)
-        c2 = fl_core.Client("C2", config.DEVICE, **c2_args)
-
-        # --- 加载 Checkpoint ---
         if it > 0:
-            ckpt_c1 = f"checkpoints/c1_iter_{it}.pth"
-            ckpt_c2 = f"checkpoints/c2_iter_{it}.pth"
-            try:
-                if os.path.exists(ckpt_c1) and os.path.exists(ckpt_c2):
-                    state_c1 = torch.load(ckpt_c1, map_location=config.DEVICE)
-                    c1.model.load_state_dict(state_c1, strict=False)
+            # 加载上一轮
+            c1.model.load_state_dict(torch.load(
+                f"checkpoints/c1_iter_{it}.pth", map_location=config.DEVICE), strict=False)
+            c2.model.load_state_dict(torch.load(
+                f"checkpoints/c2_iter_{it}.pth", map_location=config.DEVICE), strict=False)
 
-                    state_c2 = torch.load(ckpt_c2, map_location=config.DEVICE)
-                    c2.model.load_state_dict(state_c2, strict=False)
+            if config.USE_AGGREGATION:
+                state = c1.model.state_dict()
+                filtered = {k: v for k, v in state.items(
+                ) if "initial" not in k and "struct_encoder" not in k and "rel_embedding" not in k}
+                server.global_model.load_state_dict(filtered, strict=False)
 
-                    logging.info(f"  ✅ Loaded checkpoints from Iter {it}")
+            if pseudo_anchors_1:
+                c1.update_anchors(pseudo_anchors_1)
+            if pseudo_anchors_2:
+                c2.update_anchors(pseudo_anchors_2)
 
-                    if config.USE_AGGREGATION:
-                        state = c1.model.state_dict()
-                        filtered = {k: v for k, v in state.items()
-                                    if "initial" not in k and "struct_encoder" not in k}
-                        server.global_model.load_state_dict(
-                            filtered, strict=False)
-
-                    if pseudo_anchors_1:
-                        c1.update_anchors(pseudo_anchors_1)
-                    if pseudo_anchors_2:
-                        c2.update_anchors(pseudo_anchors_2)
-                else:
-                    logging.warning(
-                        "  ⚠️ Checkpoints not found. Training from scratch.")
-            except Exception as e:
-                logging.error(f"  ❌ Failed to load checkpoint: {e}")
-
-        # --- 训练 ---
         global_w = server.get_global_model_state() if (
             it > 0 and config.USE_AGGREGATION) else None
-        current_rounds = config.FL_ROUNDS if it == 0 else max(
-            20, int(config.FL_ROUNDS * 0.5))
 
-        try:
-            for r in range(current_rounds):
-                w1, l1 = c1.local_train(
-                    global_w, config.FL_LOCAL_EPOCHS, config.FL_BATCH_SIZE, config.FL_LR)
-                w2, l2 = c2.local_train(
-                    global_w, config.FL_LOCAL_EPOCHS, config.FL_BATCH_SIZE, config.FL_LR)
+        # 【核心优化】第一轮跑 100 次，让 Loss 充分下降
+        rounds = 100 if it == 0 else 30
 
-                if config.USE_AGGREGATION:
-                    global_w = server.aggregate_models([w1, w2])
+        for r in range(rounds):
+            w1, l1 = c1.local_train(
+                global_w, 3, config.FL_BATCH_SIZE, config.FL_LR)
+            w2, l2 = c2.local_train(
+                global_w, 3, config.FL_BATCH_SIZE, config.FL_LR)
+            if config.USE_AGGREGATION:
+                global_w = server.aggregate_models([w1, w2])
 
-                if ((r + 1) % 10 == 0) or (r == 0):
-                    mode = "FedAvg" if config.USE_AGGREGATION else "Isolated"
-                    logging.info(
-                        f"  Round {r+1}/{current_rounds} [{mode}] | Loss: {l1:.4f} / {l2:.4f}")
+            if (r + 1) % 10 == 0:
+                logging.info(
+                    f"   Round {r+1}/{rounds} | Loss: {l1:.4f} / {l2:.4f}")
+                writer.add_scalar(f'Loss/Iter{it+1}', l1, r)
 
-                writer.add_scalar(f'Loss/C1_Iter{it+1}', l1, r)
-                writer.add_scalar(f'Loss/C2_Iter{it+1}', l2, r)
-                global_step += 1
-
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                logging.error("  [Error] GPU OOM!")
-                break
-            else:
-                raise e
-
-        # --- 保存 ---
         torch.save(c1.model.state_dict(), f"checkpoints/c1_iter_{it+1}.pth")
         torch.save(c2.model.state_dict(), f"checkpoints/c2_iter_{it+1}.pth")
 
-        # --- 评估 (使用 Fusion) ---
-        logging.info(f"\n  🔍 Iteration {it+1} Evaluation:")
         c1.model.eval()
         c2.model.eval()
-
         with torch.no_grad():
-            if config.MODEL_ARCH in ['gcn', 'decoupled']:
-                # 获取 GCN 特征
-                emb_1 = c1.model(c1.adj).detach().cpu()
-                emb_2 = c2.model(c2.adj).detach().cpu()
+            emb_1 = c1.model(adj_1).detach().cpu()
+            emb_2 = c2.model(adj_2).detach().cpu()
+            e1_d = {i: emb_1[i] for i in range(len(emb_1))}
+            e2_d = {i: emb_2[i] for i in range(len(emb_2))}
+            hits, _ = evaluate.evaluate_alignment(test_pairs, e1_d, e2_d, torch.nn.Identity(), torch.nn.Identity(
+            ), config.EVAL_K_VALUES, sbert_1=sb_1, sbert_2=sb_2, alpha=config.EVAL_FUSION_ALPHA)
+            final_hits = hits
+            writer.add_scalar('Eval/Hits@1', hits[1], it + 1)
 
-                e1_d = {i: emb_1[i] for i in range(len(emb_1))}
-                e2_d = {i: emb_2[i] for i in range(len(emb_2))}
-
-                # 【关键修改】传入 SBERT 和 Alpha 进行融合
-                hits, mrr = evaluate.evaluate_alignment(
-                    test_pairs, e1_d, e2_d,
-                    torch.nn.Identity(), torch.nn.Identity(),
-                    config.EVAL_K_VALUES,
-                    sbert_1=sb_1, sbert_2=sb_2,   # 传入 SBERT
-                    alpha=config.EVAL_FUSION_ALPHA  # 传入 Config 里的 0.42
-                )
-            else:
-                # TransE 旧逻辑
-                emb_1 = te_1
-                emb_2 = te_2
-                hits, mrr = evaluate.evaluate_alignment(
-                    test_pairs, {i: emb_1[i] for i in range(len(emb_1))},
-                    {i: emb_2[i] for i in range(len(emb_2))},
-                    c1.model.cpu(), c1.model.cpu(),
-                    config.EVAL_K_VALUES
-                )
-
-        # 更新最终结果变量
-        final_hits = hits
-        final_mrr = mrr
-
-        if config.DEVICE.type == 'mps':
-            torch.mps.empty_cache()
-        elif config.DEVICE.type == 'cuda':
-            torch.cuda.empty_cache()
-
-        writer.add_scalar('Eval/MRR', mrr, it + 1)
-        writer.add_scalar('Eval/Hits@1', hits.get(1, 0), it + 1)
-
-        # --- 伪标签 ---
         if it < ITERATIONS - 1:
-            thresh = max(0.50, 0.80 - (it * 0.05))
-            logging.info(
-                f"  🌱 Generating Pseudo-Labels (Threshold={thresh:.2f})...")
+            thresh = 0.75 + (it * 0.05)
+            new_pairs = generate_pseudo_pairs(
+                emb_1, emb_2, valid_ids_1, valid_ids_2, threshold=thresh)
+            for i, j in new_pairs:
+                pseudo_anchors_1[i] = emb_2[j]
+                pseudo_anchors_2[j] = emb_1[i]
+            logging.info(f"   ⚓️ Anchors Updated: {len(new_pairs)}")
 
-            new_pairs = generate_pseudo_pairs(emb_1, emb_2, threshold=thresh)
-            for idx1, idx2 in new_pairs:
-                pseudo_anchors_1[idx1] = emb_2[idx2]
-                pseudo_anchors_2[idx2] = emb_1[idx1]
-            logging.info(f"     Cumulative anchors: {len(pseudo_anchors_1)}")
+    # 【新增】保存最终模型，方便后续分析
+    print("💾 Saving Final Models...")
+    torch.save(c1.model.state_dict(), "checkpoints/c1_final.pth")
+    torch.save(c2.model.state_dict(), "checkpoints/c2_final.pth")
 
-        logging.info("  [System] Cleaning up memory...")
-        del server, c1, c2, global_w, w1, w2, emb_1, emb_2
-        gc.collect()
-
-    # --- 4. 实验结束与记录 ---
-    logging.info("\n--- 实验结束 ---")
+    logging.info(f"\n✨ Final Result Hits@1: {final_hits[1]:.2f}%")
     writer.close()
-
     if HAS_LOGGER:
-        # 自动确定实验名称
-        if config.MODEL_ARCH == 'decoupled':
-            if config.USE_AGGREGATION:
-                exp_name = "FedKG (Proposed)"
-            else:
-                exp_name = "Isolation (Local)"
-        elif config.MODEL_ARCH == 'gcn':
-            if config.USE_AGGREGATION:
-                exp_name = "FedAvg (Full GCN)"
-            else:
-                exp_name = "Isolation (GCN)"
-        else:
-            exp_name = f"Experiment ({config.MODEL_ARCH})"
-
-        logging.info(f"📝 正在记录实验结果，名称: {exp_name}")
-
-        utils_logger.log_experiment_result(
-            exp_name=exp_name,
-            dataset=config.CURRENT_DATASET_NAME,
-            metrics={
-                "hits1": final_hits.get(1, 0),
-                "hits10": final_hits.get(10, 0),
-                "mrr": final_mrr
-            },
-            params={
-                "alpha": config.EVAL_FUSION_ALPHA,
-                "arch": config.MODEL_ARCH,
-                "aggregation": config.USE_AGGREGATION,
-                "iterations": ITERATIONS
-            }
-        )
+        result_logger.log_experiment_result("FedKG (Final)", config.CURRENT_DATASET_NAME, {
+                                            "hits1": final_hits.get(1, 0)}, {"strategy": "Pre-Finetuned-SBERT"})
 
 
 if __name__ == "__main__":
