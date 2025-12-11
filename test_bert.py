@@ -18,17 +18,16 @@ import random
 # ==========================================
 # 🎛️ 实验控制台
 # ==========================================
-# 建议改为 'mixed' 以解决遗忘问题
+# 推荐使用 'mixed' 以获得最佳效果
 # 'description' -> 纯描述
 # 'polished'    -> 纯润色
-# 'mixed'       -> [NEW] 混合训练 (Desc + Polish 放在一起训)
-# 'dual_stage'  -> [DEPRECATED] 顺序训练 (会导致遗忘，不推荐)
+# 'mixed'       -> 混合训练 (Desc + Polish 同时训练，效果最佳)
 TEXT_MODE = 'mixed'
 
 # 联邦设置
 ROUNDS = 5
 LOCAL_EPOCHS = 1
-BATCH_SIZE = 4
+BATCH_SIZE = 4       # 显存安全值
 LR = 2e-5
 PSEUDO_THRESHOLD = 0.85
 
@@ -41,7 +40,7 @@ def clean_memory():
     gc.collect()
 
 # ==========================================
-# 1. 客户端 (支持混合训练)
+# 1. 客户端 (支持混合训练 & 动态显存管理)
 # ==========================================
 
 
@@ -58,7 +57,7 @@ class ClientSBERT:
 
     def update_pseudo_labels(self, local_indices, remote_emb_desc, remote_emb_polish):
         """
-        接收伪标签，混合两种数据
+        接收伪标签，混合两种数据构建训练集
         """
         self.train_pairs = []
 
@@ -69,14 +68,15 @@ class ClientSBERT:
             remote_emb_polish = remote_emb_polish.cpu()
 
         for i, local_id in enumerate(local_indices):
-            # 1. 加入 Description 样本
+            # 1. 加入 Description 样本 (强语义)
             if 'desc' in self.text_data and local_id in self.text_data['desc']:
                 target = remote_emb_desc[i].detach().clone()
                 self.train_pairs.append(
                     (self.text_data['desc'][local_id], target))
 
-            # 2. 加入 Polished 样本 (如果有)
+            # 2. 加入 Polished 样本 (强结构)
             if 'polish' in self.text_data and local_id in self.text_data['polish']:
+                # 如果对方没有 polish 向量，就用 desc 向量顶替
                 target = remote_emb_polish[i].detach().clone(
                 ) if remote_emb_polish is not None else remote_emb_desc[i].detach().clone()
                 self.train_pairs.append(
@@ -90,6 +90,7 @@ class ClientSBERT:
         if not self.train_pairs:
             return self.sbert.state_dict(), 0.0
 
+        # 模型上 GPU
         self.sbert.to(self.device)
         self.sbert.train()
 
@@ -128,10 +129,11 @@ class ClientSBERT:
 
             current_loss = loss.item()
             total_loss += current_loss
-            pbar.set_postfix({'loss': f"{current_loss:.6f}"})  # 显示更多小数位
+            pbar.set_postfix({'loss': f"{current_loss:.6f}"})
 
             del targets, features, out, embeddings, loss
 
+        # 清理
         del optimizer
         self.sbert.to('cpu')
         clean_memory()
@@ -183,7 +185,7 @@ class ServerSBERT:
         return avg_weights
 
 # ==========================================
-# 3. 数据加载
+# 3. 数据加载 (支持 mixed 模式)
 # ==========================================
 
 
@@ -198,21 +200,31 @@ def load_data_dict(mode):
             return {}
         return data_loader.load_pickle_descriptions(path, ent_map_tuple)
 
+    # 预加载
     desc1 = _safe_load("description1.pkl", map_tuple_1)
     desc2 = _safe_load("description2.pkl", map_tuple_2)
     polish1 = _safe_load("desc_polish_1.pkl", map_tuple_1)
     polish2 = _safe_load("desc_polish_2.pkl", map_tuple_2)
 
-    c1_data = {'desc': desc1, 'polish': polish1}
-    c2_data = {'desc': desc2, 'polish': polish2}
+    # Mixed 模式需要同时持有两份数据
+    if mode == 'mixed' or mode == 'dual_stage':
+        c1_data = {'desc': desc1, 'polish': polish1}
+        c2_data = {'desc': desc2, 'polish': polish2}
+    elif mode == 'description':
+        c1_data = {'desc': desc1}
+        c2_data = {'desc': desc2}
+    elif mode == 'polished':
+        c1_data = {'desc': polish1, 'polish': polish1}
+        c2_data = {'desc': polish2, 'polish': polish2}
+    else:
+        # 默认回退
+        c1_data = {'desc': desc1}
+        c2_data = {'desc': desc2}
 
     return c1_data, c2_data
 
 # ==========================================
 # 4. 主流程
-# ==========================================
-# ==========================================
-# 4. 主流程 (修复评估对齐 Bug 版)
 # ==========================================
 
 
@@ -232,46 +244,35 @@ def run_pure_sbert():
     for r in range(ROUNDS + 1):
         print(f"\n{'-'*50}\n🔄 Round {r} / {ROUNDS} [{TEXT_MODE}]\n{'-'*50}")
 
-        # --- Step 1: 编码 (严格获取各自的 IDs) ---
-        print("   Encoding Entities...")
+        # --- Step 1: 编码所有模态 (关键：接住 IDs) ---
+        print("   Encoding Entities (Desc & Polish)...")
         ids1_desc, emb1_desc = c1.encode_all('desc')
         ids2_desc, emb2_desc = c2.encode_all('desc')
 
-        # [修复] 不要丢弃 IDs，一定要接住它！
         ids1_poly, emb1_polish = c1.encode_all('polish')
         ids2_poly, emb2_polish = c2.encode_all('polish')
 
-        # --- Step 2: 双重评估 ---
+        # --- Step 2: 双重评估 (Dual Evaluation) ---
         print("   📊 Evaluating on [Description] Input...")
-        # 使用 ids1_desc 构建字典
+        # 严格对齐 ID
         e1_desc = {id_val: emb1_desc[i] for i, id_val in enumerate(ids1_desc)}
         e2_desc = {id_val: emb2_desc[i] for i, id_val in enumerate(ids2_desc)}
-
-        h_d, m_d = evaluate.evaluate_alignment(
-            test_pairs,
-            {k: torch.zeros(1) for k in e1_desc}, {k: torch.zeros(1)
-                                                   for k in e2_desc},
-            torch.nn.Identity(), torch.nn.Identity(), config.EVAL_K_VALUES,
-            sbert_1=e1_desc, sbert_2=e2_desc, alpha=0.0
-        )
+        h_d, m_d = evaluate.evaluate_alignment(test_pairs, {k: torch.zeros(1) for k in e1_desc}, {k: torch.zeros(1) for k in e2_desc},
+                                               torch.nn.Identity(), torch.nn.Identity(), config.EVAL_K_VALUES,
+                                               sbert_1=e1_desc, sbert_2=e2_desc, alpha=0.0)
 
         print("   📊 Evaluating on [Polished] Input...")
-        # [修复] 使用 ids1_poly 构建字典
+        # 严格对齐 ID
         e1_pol = {id_val: emb1_polish[i] for i, id_val in enumerate(ids1_poly)}
         e2_pol = {id_val: emb2_polish[i] for i, id_val in enumerate(ids2_poly)}
-
-        h_p, m_p = evaluate.evaluate_alignment(
-            test_pairs,
-            {k: torch.zeros(1) for k in e1_pol}, {k: torch.zeros(1)
-                                                  for k in e2_pol},
-            torch.nn.Identity(), torch.nn.Identity(), config.EVAL_K_VALUES,
-            sbert_1=e1_pol, sbert_2=e2_pol, alpha=0.0
-        )
+        h_p, m_p = evaluate.evaluate_alignment(test_pairs, {k: torch.zeros(1) for k in e1_pol}, {k: torch.zeros(1) for k in e2_pol},
+                                               torch.nn.Identity(), torch.nn.Identity(), config.EVAL_K_VALUES,
+                                               sbert_1=e1_pol, sbert_2=e2_pol, alpha=0.0)
 
         results.append({
             "round": r,
-            "desc_hits1": h_d[1],
-            "poly_hits1": h_p[1]
+            "desc_hits1": h_d[1], "desc_mrr": m_d,
+            "poly_hits1": h_p[1], "poly_mrr": m_p
         })
 
         print(
@@ -280,9 +281,8 @@ def run_pure_sbert():
         if r == ROUNDS:
             break
 
-        # --- Step 3: 生成伪标签 (基于 Description) ---
+        # --- Step 3: 生成伪标签 (基于最好的 Desc) ---
         print("   Generating Pseudo-labels (based on Description)...")
-        # 仍然使用最好的 Description 向量来找对齐
         emb1_cpu = emb1_desc.cpu()
         emb2_cpu = emb2_desc.cpu()
         sim = torch.mm(F.normalize(emb1_cpu), F.normalize(emb2_cpu).T)
@@ -303,42 +303,34 @@ def run_pure_sbert():
         # 这里的 i 和 j 是 ids1_desc 和 ids2_desc 的索引
         p_idx1 = [p[0] for p in pseudo_pairs]
         p_idx2 = [p[1] for p in pseudo_pairs]
-
-        # 找出真实的 ID
         real_ids1 = [ids1_desc[i] for i in p_idx1]
         real_ids2 = [ids2_desc[i] for i in p_idx2]
 
-        # 获取目标 Description Embedding
+        # 目标1: Peer 的 Description Embedding (直接索引获取)
         target_desc_c1 = emb2_desc[p_idx2]
         target_desc_c2 = emb1_desc[p_idx1]
 
-        # 获取目标 Polished Embedding (需要通过 ID 查找)
-        # 因为 polish 的索引可能跟 desc 不一样，不能直接用 p_idx2
-        # 这是一个稍微复杂点的地方，为了保险，我们用字典查
+        # 目标2: Peer 的 Polished Embedding (需要查字典，防止 ID 错位)
         def get_targets_by_id(target_dict, id_list):
             targets = []
             for eid in id_list:
                 if eid in target_dict:
                     targets.append(target_dict[eid])
                 else:
-                    # 如果找不到对应的 polish，就用 zeros 或者 fallback 到 desc
-                    # 这里假设肯定有
+                    # 如果对面没有 polish，就拿 desc 顶替 (Fallback)
                     targets.append(torch.zeros_like(emb1_desc[0]))
             return torch.stack(targets)
 
-        target_polish_c1 = get_targets_by_id(
-            e2_pol, real_ids1)  # 注意：这里是找 peer (C2) 的数据
-        # 等等，Client 1 的训练目标是 C2 的数据
-        # real_ids1 是 C1 的 ID，与之配对的是 real_ids2 (C2 的 ID)
-        # 所以 C1 应该学习 C2 的向量
         target_polish_c1 = get_targets_by_id(e2_pol, real_ids2)
         target_polish_c2 = get_targets_by_id(e1_pol, real_ids1)
 
         # --- Step 5: 混合训练 ---
+        # C1 (学习 C2 的 desc 和 polish)
         c1.update_pseudo_labels(real_ids1, target_desc_c1, target_polish_c1)
         _, l1 = c1.train_mixed()
         print(f"   📉 C1 Loss: {l1:.6f}")
 
+        # C2 (学习 C1 的 desc 和 polish)
         c2.update_pseudo_labels(real_ids2, target_desc_c2, target_polish_c2)
         _, l2 = c2.train_mixed()
         print(f"   📉 C2 Loss: {l2:.6f}")
@@ -357,6 +349,20 @@ def run_pure_sbert():
     for res in results:
         print(
             f"{res['round']:<6} | {res['desc_hits1']:<10.2f} | {res['poly_hits1']:<10.2f}")
+
+    # ==========================================
+    # 💾 新增: 保存最终的全局模型
+    # ==========================================
+    save_dir = f"checkpoints/sbert_{TEXT_MODE}_round{ROUNDS}"
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    print(f"\n💾 Saving global model to {save_dir} ...")
+    server.global_model.save(save_dir)
+    print("✅ Model saved successfully!")
+
+    utils_logger.log_experiment_result(
+        f"FedSBERT_Pure_{TEXT_MODE}", config.CURRENT_DATASET_NAME, results[-1])
 
 
 if __name__ == "__main__":

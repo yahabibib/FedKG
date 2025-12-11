@@ -25,6 +25,8 @@ processed_data/
 figures/
 *.json
 runs/
+output/
+fine_tuned_models/
 
 # Jupyter
 .ipynb_checkpoints/
