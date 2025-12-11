@@ -1,0 +1,22 @@
+# configs/task/structure_train.yaml
+name: "structure_alignment"
+type: "structure"  # main.py 根据这个切换流程
+
+# 指定 Phase 1 训练好的 SBERT 路径 (必须修改为你实际保存的路径)
+sbert_checkpoint: "checkpoints/sbert_mixed_round5"
+
+model:
+    gcn_dim: 300       # 节点初始特征维度
+    gcn_hidden: 600    # GCN 隐藏层
+    dropout: 0.3
+
+federated:
+    rounds: 20         # 结构训练通常需要更多轮次
+    local_epochs: 5
+    batch_size: 512    # GCN 训练比较快，Batch 可以大一点
+    lr: 5e-4
+    margin: 0.4        # MarginRankingLoss 的参数
+
+# 评估时的融合权重
+eval:
+    alpha: 0.42        # 0.42 GCN + 0.58 SBERT

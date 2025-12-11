@@ -1,0 +1,22 @@
+# configs/system/mac_optimized.yaml
+
+name: "mac_mps_offload"
+
+# 设备选择策略
+device: "mps"           # 优先尝试 MPS (Metal Performance Shaders)
+fallback_device: "cpu"  # 如果 MPS 不可用，自动回退到 CPU
+
+# 显存管理策略 (Memory Management Strategy)
+memory:
+    # [核心] 激进的卸载策略：Client 训练完一个 Batch/Epoch 后，
+    # 立即把模型踢回 CPU。这对 Mac 统一内存至关重要。
+    offload_to_cpu: true
+
+    # 强制清理显存的频率 (每多少个 step 清理一次, 0表示仅在轮次结束清理)
+    # 在 MPS 上，过于频繁的 empty_cache 可能会降低速度，建议设为 0 或 10
+    empty_cache_freq: 0
+
+# 硬件限制覆盖 (Safety Overrides)
+# 可以在这里强制限制 task 中的 batch_size，防止 task 设置过大导致 OOM
+# 如果 task.batch_size > max_batch_size，代码逻辑里可以取最小值
+max_batch_size: 8

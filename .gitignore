@@ -26,6 +26,7 @@ figures/
 *.json
 runs/
 output/
+outputs/
 fine_tuned_models/
 
 # Jupyter

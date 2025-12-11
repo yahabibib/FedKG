@@ -1,0 +1,32 @@
+# configs/task/sbert_mixed.yaml
+
+name: "sbert_finetune"
+type: "sbert"  # 任务类型标识，用于 main.py 路由
+
+model:
+    name: "paraphrase-multilingual-mpnet-base-v2"
+    # SBERT 的最大序列长度，超过截断。Mac 上显存不够可以调小 (如 128)
+    max_seq_length: 128
+
+# 联邦学习参数
+federated:
+    rounds: 5
+    local_epochs: 1
+    # 这里定义算法想要的 BatchSize，如果太大，System 配置可以限制它
+    batch_size: 4
+    lr: 2e-5
+
+# 策略参数 (我们之前的 TEXT_MODE)
+strategy:
+    # mixed: 混合训练 (推荐)
+    # polished: 纯润色
+    # description: 纯描述
+    text_mode: "mixed"
+
+    # 伪标签阈值
+    pseudo_threshold: 0.85
+
+# Checkpoint 保存
+checkpoint:
+    save_dir: "checkpoints/"
+    save_best: true

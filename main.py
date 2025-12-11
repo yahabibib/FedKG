@@ -1,340 +1,206 @@
-# 🚀 main.py
-# 【最终版】集成 TensorBoard、双模融合推理(Config配置)、自动化结果记录
-
-import torch
-import torch.nn.functional as F
-import os
-import gc
-import config
-import data_loader
-import precompute
-import fl_core
-import evaluate
+import hydra
+from omegaconf import DictConfig, OmegaConf
 import logging
-import datetime
-from torch.utils.tensorboard import SummaryWriter
+import os
+import torch
 
-# --- 0. 基础设施设置 --- 之前加入这段：
+# --- 导入我们重构后的核心组件 ---
+# 1. 数据层
+from src.data.dataset import AlignmentTaskData
+# 2. 工具层
+from src.utils.device_manager import DeviceManager
+from src.utils.metrics import eval_alignment
+from src.utils.logger import log_experiment_result
+# 3. 联邦层
+from src.federation.server import Server
+from src.federation.client_sbert import ClientSBERT
+from src.federation.strategy import PseudoLabelGenerator
 
-# --- 新增：引入结果记录器 ---
-try:
-    import utils_logger
-    HAS_LOGGER = True
-except ImportError:
-    HAS_LOGGER = False
-    print("⚠️ 警告: 未找到 utils_logger.py，实验结果将不会自动保存到 JSON。")
-
-# ----------------------------
-
-# --- 0. 基础设施设置 ---
+# 获取 Hydra 的 logger，它会自动将日志输出到 outputs/日期/时间/main.log
+log = logging.getLogger(__name__)
 
 
-def setup_infrastructure():
-    for folder in ["checkpoints", "logs", "runs"]:
-        if not os.path.exists(folder):
-            os.makedirs(folder)
+@hydra.main(config_path="configs", config_name="config", version_base="1.2")
+def main(cfg: DictConfig):
+    """
+    FedAnchor 2.0 主入口
+    """
+    # 1. 打印实验元信息
+    log.info(f"🚀 Starting Experiment: {cfg.experiment_name}")
+    log.info(
+        f"⚙️  Task Type: {cfg.task.type} | Mode: {cfg.task.strategy.text_mode}")
+    log.info(
+        f"💻 Device Strategy: {cfg.system.device} (Offload: {cfg.system.memory.offload_to_cpu})")
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"logs/exp_{config.CURRENT_DATASET_NAME}_{timestamp}.log"
+    # 打印完整配置方便调试 (可选)
+    # log.info(f"\n{OmegaConf.to_yaml(cfg)}")
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_filename, encoding='utf-8'),
-            logging.StreamHandler()
-        ]
+    # 2. 初始化设备管理器 (处理 MPS/CUDA 和显存策略)
+    dm = DeviceManager(cfg.system)
+
+    # 3. 加载数据 (AlignmentTaskData 会自动解析 source/target 配置)
+    log.info("📚 Loading Datasets...")
+    try:
+        # 这里会自动加载 ent_ids, pairs, desc, polish 等所有文件
+        task_data = AlignmentTaskData(cfg.data)
+    except FileNotFoundError as e:
+        log.error(f"❌ Data loading failed: {e}")
+        return
+    except Exception as e:
+        log.exception(f"❌ Unexpected error during data loading: {e}")
+        return
+
+    # 4. 初始化联邦组件
+    # Server: 负责聚合，常驻 CPU
+    server = Server(cfg)
+
+    # Client: 负责训练，根据 DeviceManager 策略使用 GPU/MPS
+    # 注意：我们将 task_data.source (KGDataset) 传给 C1，task_data.target 传给 C2
+    c1 = ClientSBERT("C1", cfg, task_data.source, dm)
+    c2 = ClientSBERT("C2", cfg, task_data.target, dm)
+
+    # 5. 任务分发 (Task Dispatch)
+    # 根据 config.yaml 中的 task.type 决定运行哪个流程
+    if cfg.task.type == 'sbert':
+        run_sbert_workflow(cfg, server, c1, c2, task_data.test_pairs, dm)
+    elif cfg.task.type == 'structure':
+        log.info("🚧 Structure workflow (GCN) is under construction...")
+        # run_structure_workflow(cfg, server, c1, c2, task_data)
+    else:
+        log.error(f"❌ Unknown task type: {cfg.task.type}")
+
+
+def run_sbert_workflow(cfg, server, c1, c2, test_pairs, dm):
+    """
+    SBERT 混合微调主流程 (SBERT Mixed Fine-tuning Workflow)
+    """
+    results = []
+    rounds = cfg.task.federated.rounds
+    threshold = cfg.task.strategy.pseudo_threshold
+    text_mode = cfg.task.strategy.text_mode
+
+    for r in range(rounds + 1):
+        log.info(f"\n{'='*40}\n🔄 Round {r}/{rounds} [{text_mode}]\n{'='*40}")
+
+        # --- Step 1: 编码 (Encode) ---
+        log.info("   Encoding Entities...")
+
+        # 1.1 编码 Description (作为主要的语义锚点)
+        ids1_desc, emb1_desc = c1.encode('desc')
+        ids2_desc, emb2_desc = c2.encode('desc')
+
+        # 1.2 编码 Polished (作为结构化文本的对照组，或混合训练的素材)
+        ids1_poly, emb1_poly = c1.encode('polish')
+        ids2_poly, emb2_poly = c2.encode('polish')
+
+        # --- Step 2: 评估 (Evaluate) ---
+        # 我们进行双重评估，既看模型对自然语言(Desc)的理解，也看对结构化文本(Polish)的理解
+
+        # 2.1 评估 Description
+        log.info("   📊 Eval [Description Input]...")
+        # 构建 {id: tensor} 字典供 eval_alignment 使用
+        d1_desc = {id: emb1_desc[i] for i, id in enumerate(ids1_desc)}
+        d2_desc = {id: emb2_desc[i] for i, id in enumerate(ids2_desc)}
+
+        h_d, m_d = eval_alignment(d1_desc, d2_desc, test_pairs, device='cpu')
+
+        # 2.2 评估 Polished
+        log.info("   📊 Eval [Polished Input]...")
+        d1_poly = {id: emb1_poly[i] for i, id in enumerate(ids1_poly)}
+        d2_poly = {id: emb2_poly[i] for i, id in enumerate(ids2_poly)}
+
+        h_p, m_p = eval_alignment(d1_poly, d2_poly, test_pairs, device='cpu')
+
+        # 打印并收集结果
+        log.info(
+            f"   🏆 Result R{r}: Desc H@1={h_d[1]:.2f}% | Polish H@1={h_p[1]:.2f}%")
+
+        current_metrics = {
+            "round": r,
+            "desc_hits1": h_d[1], "desc_mrr": m_d,
+            "poly_hits1": h_p[1], "poly_mrr": m_p
+        }
+        results.append(current_metrics)
+
+        # 如果是最后一轮，评估完就结束，不进行训练
+        if r == rounds:
+            break
+
+        # --- Step 3: 策略 - 生成伪标签 (Strategy) ---
+        log.info(f"   Generating Pseudo-labels (Threshold={threshold})...")
+
+        # 核心逻辑：我们始终信任 Description 生成的伪标签，因为它的语义质量最高 (Zero-shot 58% vs 41%)
+        # 使用 src.federation.strategy.PseudoLabelGenerator
+        pairs_idx = PseudoLabelGenerator.generate(
+            emb1_desc, emb2_desc, threshold, device='cpu')
+
+        log.info(f"   🌱 Found {len(pairs_idx)} high-confidence pairs.")
+
+        # 安全检查：如果伪标签太少，强行训练会导致过拟合或崩塌
+        if len(pairs_idx) < 50:
+            log.warning(
+                "   ⚠️ Too few pairs (<50), skipping training this round.")
+            continue
+
+        # --- Step 4: 准备训练数据 (Data Preparation) ---
+        # pairs_idx 是 emb1_desc 和 emb2_desc 的索引对 (index)
+        p_idx1 = [p[0] for p in pairs_idx]
+        p_idx2 = [p[1] for p in pairs_idx]
+
+        # 提取交叉目标 (Cross-target): C1 学习 C2 的特征，C2 学习 C1 的特征
+
+        # 目标 A: Description Embedding (强语义)
+        target_desc_for_c1 = emb2_desc[p_idx2]
+        target_desc_for_c2 = emb1_desc[p_idx1]
+
+        # 目标 B: Polished Embedding (强结构) - 用于混合训练
+        target_poly_for_c1 = emb2_poly[p_idx2]
+        target_poly_for_c2 = emb1_poly[p_idx1]
+
+        # 通知 Client 准备 DataLoader
+        # Client 内部会根据 cfg.task.strategy.text_mode 决定如何混合这些数据
+        c1.prepare_training_data(
+            p_idx1, target_desc_for_c1, target_poly_for_c1)
+        c2.prepare_training_data(
+            p_idx2, target_desc_for_c2, target_poly_for_c2)
+
+        # --- Step 5: 本地训练 (Local Training) ---
+        # 串行训练：C1 上 GPU -> 练完 -> 下 GPU -> C2 上 GPU
+        # DeviceManager 会在 Client 内部自动管理显存
+
+        w1, l1 = c1.train()
+        log.info(f"   📉 C1 Loss: {l1:.6f}")
+
+        w2, l2 = c2.train()
+        log.info(f"   📉 C2 Loss: {l2:.6f}")
+
+        # --- Step 6: 聚合 (Aggregation) ---
+        # Server 执行 FedAvg
+        server.aggregate([w1, w2])
+
+        # 分发全局参数
+        global_weights = server.get_global_weights()
+        c1.model.load_state_dict(global_weights)
+        c2.model.load_state_dict(global_weights)
+
+        # 强制显存清理 (Double Check)
+        dm.clean_memory()
+
+    # --- 流程结束 ---
+
+    # 1. 保存最佳模型
+    if cfg.task.checkpoint.save_best:
+        server.save_model(suffix=f"{text_mode}_round{rounds}")
+
+    # 2. 记录最终结果到 JSON
+    log_experiment_result(
+        cfg.experiment_name,
+        cfg.data.name,
+        results[-1],
+        config=cfg
     )
-
-    writer = SummaryWriter(
-        log_dir=f"runs/{config.CURRENT_DATASET_NAME}_{timestamp}")
-    logging.info(f"📁 日志文件: {log_filename}")
-    return writer
-
-
-def generate_pseudo_pairs(emb1, emb2, threshold=0.75):
-    """ 生成伪标签 (RNN 逻辑) """
-    emb1 = F.normalize(emb1, dim=1)
-    emb2 = F.normalize(emb2, dim=1)
-    sim_mat = torch.mm(emb1, emb2.T)
-    values_1, indices_1 = torch.max(sim_mat, dim=1)
-    values_2, indices_2 = torch.max(sim_mat, dim=0)
-
-    pseudo_pairs = []
-    rnn_count = 0
-    for i in range(len(emb1)):
-        j = indices_1[i].item()
-        if indices_2[j].item() == i:
-            rnn_count += 1
-            if values_1[i].item() > threshold:
-                pseudo_pairs.append((i, j))
-
-    logging.info(f"     [Diagnosis] Total RNN pairs found: {rnn_count}")
-    logging.info(
-        f"     [Diagnosis] Pairs passing threshold ({threshold:.2f}): {len(pseudo_pairs)}")
-    return pseudo_pairs
-
-
-def run_pipeline():
-    writer = setup_infrastructure()
-
-    logging.info(f"{'='*60}")
-    logging.info(f"🚀 启动联邦迭代自训练 (Fusion Optimized)")
-    logging.info(f"📚 数据集: {config.CURRENT_DATASET_NAME}")
-    logging.info(f"🧠 模型架构: {config.MODEL_INFO}")
-    logging.info(f"⚖️  融合权重: Alpha = {config.EVAL_FUSION_ALPHA}")
-    logging.info(f"{'='*60}")
-
-    # --- 1. 数据加载 ---
-    logging.info("--- 阶段一：数据加载 ---")
-    ent_1 = data_loader.load_id_map(config.BASE_PATH + "ent_ids_1")
-    rel_1 = data_loader.load_id_map(config.BASE_PATH + "rel_ids_1")
-    trip_1 = data_loader.load_triples(config.BASE_PATH + "triples_1")
-
-    pkl_1 = config.BASE_PATH + "description1.pkl"
-    attr_1 = data_loader.load_pickle_descriptions(pkl_1, ent_1) if os.path.exists(pkl_1) else \
-        data_loader.load_attribute_triples(
-            config.BASE_PATH + "zh_att_triples", ent_1)
-
-    ent_2 = data_loader.load_id_map(config.BASE_PATH + "ent_ids_2")
-    rel_2 = data_loader.load_id_map(config.BASE_PATH + "rel_ids_2")
-    trip_2 = data_loader.load_triples(config.BASE_PATH + "triples_2")
-
-    pkl_2 = config.BASE_PATH + "description2.pkl"
-    attr_2 = data_loader.load_pickle_descriptions(pkl_2, ent_2) if os.path.exists(pkl_2) else \
-        data_loader.load_attribute_triples(
-            config.BASE_PATH + "en_att_triples", ent_2)
-
-    test_pairs = data_loader.load_alignment_pairs(
-        config.BASE_PATH + "ref_pairs")
-    num_ent_1 = max(list(ent_1[0].keys())) + 1
-    num_ent_2 = max(list(ent_2[0].keys())) + 1
-
-    # --- 2. 离线预计算 ---
-    logging.info("--- 阶段二：离线预计算 ---")
-    te_1, te_2 = None, None
-    if config.MODEL_ARCH == 'projection':
-        num_rel = max(len(rel_1[0]), len(rel_2[0]))
-        te_1 = precompute.train_transe(
-            trip_1, ent_1, num_ent_1, num_rel, "KG1")
-        te_2 = precompute.train_transe(
-            trip_2, ent_2, num_ent_2, num_rel, "KG2")
-
-    cache_path_1 = os.path.join("cache", "sbert_KG1.pt")
-    cache_path_2 = os.path.join("cache", "sbert_KG2.pt")
-    if not os.path.exists("cache"):
-        os.makedirs("cache")
-
-    sb_1 = precompute.get_bert_embeddings(
-        ent_1, attr_1, "KG1", cache_file=cache_path_1)
-    sb_2 = precompute.get_bert_embeddings(
-        ent_2, attr_2, "KG2", cache_file=cache_path_2)
-
-    adj_1, adj_2 = None, None
-    if config.MODEL_ARCH in ['gcn', 'decoupled']:
-        logging.info(f"[Mode: {config.MODEL_ARCH}] 构建邻接矩阵...")
-        # 注意：MPS 无法处理稀疏矩阵，所以这里 adj 保持在 CPU
-        adj_1 = precompute.build_adjacency_matrix(trip_1, num_ent_1)
-        adj_2 = precompute.build_adjacency_matrix(trip_2, num_ent_2)
-
-    # --- 3. 联邦迭代训练 ---
-    logging.info("--- 阶段三：联邦迭代自训练 ---")
-    # 如果你要做消融实验，可以在这里把 ITERATIONS 改成 config 里的变量，或者硬编码
-    ITERATIONS = 5
-    pseudo_anchors_1 = {}
-    pseudo_anchors_2 = {}
-
-    global_step = 0
-
-    # 初始化变量以防循环未执行
-    final_hits = {}
-    final_mrr = 0.0
-
-    for it in range(ITERATIONS):
-        logging.info(f"\n{'#'*40}")
-        logging.info(f"🔄 Iteration {it+1}/{ITERATIONS}")
-        logging.info(f"{'#'*40}")
-
-        server = fl_core.Server()
-
-        c1_args = {'bert': sb_1, 'num_ent': num_ent_1}
-        c2_args = {'bert': sb_2, 'num_ent': num_ent_2}
-
-        if config.MODEL_ARCH in ['gcn', 'decoupled']:
-            c1_args['adj'] = adj_1
-            c2_args['adj'] = adj_2
-        else:
-            c1_args['transe'] = te_1
-            c2_args['transe'] = te_2
-
-        c1 = fl_core.Client("C1", config.DEVICE, **c1_args)
-        c2 = fl_core.Client("C2", config.DEVICE, **c2_args)
-
-        # --- 加载 Checkpoint ---
-        if it > 0:
-            ckpt_c1 = f"checkpoints/c1_iter_{it}.pth"
-            ckpt_c2 = f"checkpoints/c2_iter_{it}.pth"
-            try:
-                if os.path.exists(ckpt_c1) and os.path.exists(ckpt_c2):
-                    state_c1 = torch.load(ckpt_c1, map_location=config.DEVICE)
-                    c1.model.load_state_dict(state_c1, strict=False)
-
-                    state_c2 = torch.load(ckpt_c2, map_location=config.DEVICE)
-                    c2.model.load_state_dict(state_c2, strict=False)
-
-                    logging.info(f"  ✅ Loaded checkpoints from Iter {it}")
-
-                    if config.USE_AGGREGATION:
-                        state = c1.model.state_dict()
-                        filtered = {k: v for k, v in state.items()
-                                    if "initial" not in k and "struct_encoder" not in k}
-                        server.global_model.load_state_dict(
-                            filtered, strict=False)
-
-                    if pseudo_anchors_1:
-                        c1.update_anchors(pseudo_anchors_1)
-                    if pseudo_anchors_2:
-                        c2.update_anchors(pseudo_anchors_2)
-                else:
-                    logging.warning(
-                        "  ⚠️ Checkpoints not found. Training from scratch.")
-            except Exception as e:
-                logging.error(f"  ❌ Failed to load checkpoint: {e}")
-
-        # --- 训练 ---
-        global_w = server.get_global_model_state() if (
-            it > 0 and config.USE_AGGREGATION) else None
-        current_rounds = config.FL_ROUNDS if it == 0 else max(
-            20, int(config.FL_ROUNDS * 0.5))
-
-        try:
-            for r in range(current_rounds):
-                w1, l1 = c1.local_train(
-                    global_w, config.FL_LOCAL_EPOCHS, config.FL_BATCH_SIZE, config.FL_LR)
-                w2, l2 = c2.local_train(
-                    global_w, config.FL_LOCAL_EPOCHS, config.FL_BATCH_SIZE, config.FL_LR)
-
-                if config.USE_AGGREGATION:
-                    global_w = server.aggregate_models([w1, w2])
-
-                if ((r + 1) % 10 == 0) or (r == 0):
-                    mode = "FedAvg" if config.USE_AGGREGATION else "Isolated"
-                    logging.info(
-                        f"  Round {r+1}/{current_rounds} [{mode}] | Loss: {l1:.4f} / {l2:.4f}")
-
-                writer.add_scalar(f'Loss/C1_Iter{it+1}', l1, r)
-                writer.add_scalar(f'Loss/C2_Iter{it+1}', l2, r)
-                global_step += 1
-
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                logging.error("  [Error] GPU OOM!")
-                break
-            else:
-                raise e
-
-        # --- 保存 ---
-        torch.save(c1.model.state_dict(), f"checkpoints/c1_iter_{it+1}.pth")
-        torch.save(c2.model.state_dict(), f"checkpoints/c2_iter_{it+1}.pth")
-
-        # --- 评估 (使用 Fusion) ---
-        logging.info(f"\n  🔍 Iteration {it+1} Evaluation:")
-        c1.model.eval()
-        c2.model.eval()
-
-        with torch.no_grad():
-            if config.MODEL_ARCH in ['gcn', 'decoupled']:
-                # 获取 GCN 特征
-                emb_1 = c1.model(c1.adj).detach().cpu()
-                emb_2 = c2.model(c2.adj).detach().cpu()
-
-                e1_d = {i: emb_1[i] for i in range(len(emb_1))}
-                e2_d = {i: emb_2[i] for i in range(len(emb_2))}
-
-                # 【关键修改】传入 SBERT 和 Alpha 进行融合
-                hits, mrr = evaluate.evaluate_alignment(
-                    test_pairs, e1_d, e2_d,
-                    torch.nn.Identity(), torch.nn.Identity(),
-                    config.EVAL_K_VALUES,
-                    sbert_1=sb_1, sbert_2=sb_2,   # 传入 SBERT
-                    alpha=config.EVAL_FUSION_ALPHA  # 传入 Config 里的 0.42
-                )
-            else:
-                # TransE 旧逻辑
-                emb_1 = te_1
-                emb_2 = te_2
-                hits, mrr = evaluate.evaluate_alignment(
-                    test_pairs, {i: emb_1[i] for i in range(len(emb_1))},
-                    {i: emb_2[i] for i in range(len(emb_2))},
-                    c1.model.cpu(), c1.model.cpu(),
-                    config.EVAL_K_VALUES
-                )
-
-        # 更新最终结果变量
-        final_hits = hits
-        final_mrr = mrr
-
-        if config.DEVICE.type == 'mps':
-            torch.mps.empty_cache()
-        elif config.DEVICE.type == 'cuda':
-            torch.cuda.empty_cache()
-
-        writer.add_scalar('Eval/MRR', mrr, it + 1)
-        writer.add_scalar('Eval/Hits@1', hits.get(1, 0), it + 1)
-
-        # --- 伪标签 ---
-        if it < ITERATIONS - 1:
-            thresh = max(0.50, 0.80 - (it * 0.05))
-            logging.info(
-                f"  🌱 Generating Pseudo-Labels (Threshold={thresh:.2f})...")
-
-            new_pairs = generate_pseudo_pairs(emb_1, emb_2, threshold=thresh)
-            for idx1, idx2 in new_pairs:
-                pseudo_anchors_1[idx1] = emb_2[idx2]
-                pseudo_anchors_2[idx2] = emb_1[idx1]
-            logging.info(f"     Cumulative anchors: {len(pseudo_anchors_1)}")
-
-        logging.info("  [System] Cleaning up memory...")
-        del server, c1, c2, global_w, w1, w2, emb_1, emb_2
-        gc.collect()
-
-    # --- 4. 实验结束与记录 ---
-    logging.info("\n--- 实验结束 ---")
-    writer.close()
-
-    if HAS_LOGGER:
-        # 自动确定实验名称
-        if config.MODEL_ARCH == 'decoupled':
-            if config.USE_AGGREGATION:
-                exp_name = "FedKG (Proposed)"
-            else:
-                exp_name = "Isolation (Local)"
-        elif config.MODEL_ARCH == 'gcn':
-            if config.USE_AGGREGATION:
-                exp_name = "FedAvg (Full GCN)"
-            else:
-                exp_name = "Isolation (GCN)"
-        else:
-            exp_name = f"Experiment ({config.MODEL_ARCH})"
-
-        logging.info(f"📝 正在记录实验结果，名称: {exp_name}")
-
-        utils_logger.log_experiment_result(
-            exp_name=exp_name,
-            dataset=config.CURRENT_DATASET_NAME,
-            metrics={
-                "hits1": final_hits.get(1, 0),
-                "hits10": final_hits.get(10, 0),
-                "mrr": final_mrr
-            },
-            params={
-                "alpha": config.EVAL_FUSION_ALPHA,
-                "arch": config.MODEL_ARCH,
-                "aggregation": config.USE_AGGREGATION,
-                "iterations": ITERATIONS
-            }
-        )
+    log.info("✅ SBERT Workflow Completed Successfully.")
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    main()
