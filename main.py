@@ -176,102 +176,153 @@ def run_sbert_workflow(cfg, server, c1, c2, test_pairs, dm):
                           cfg.data.name, results[-1], config=cfg)
 
 
-# main.py (部分覆盖 run_structure_workflow)
-
 def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
     """
-    Phase 2: 结构训练工作流 (GCN Training) - 优化版
+    Phase 2: 结构训练工作流 (GCN Training) - 终极修正版 (含语义一致性过滤)
+    策略：
+    1. 训练：基于当前锚点训练 GCN (动态轮次 + 早停)。
+    2. 评估：使用 Score Fusion (GCN + SBERT 加权)。
+    3. 挖掘：使用 Pure GCN 挖掘结构相似对。
+    4. 过滤：使用 Fixed SBERT 进行语义一致性检查，剔除结构假阳性。
+    5. 更新：将锚点锁定回 Fixed SBERT 语义空间。
     """
     results = []
     rounds = cfg.task.federated.rounds
     alpha = cfg.task.eval.alpha
     base_threshold = cfg.task.strategy.pseudo_threshold
-
-    # 起始阈值
     threshold_start = 0.70
 
-    # 获取初始 SBERT 锚点 (用于评估时的融合，不用于挖掘)
-    sb_emb1 = to_dict(c1.dataset.ids, c1.anchor_embeddings)
-    sb_emb2 = to_dict(c2.dataset.ids, c2.anchor_embeddings)
+    # --- [关键] 1. 锁定原始语义坐标 (Source of Truth) ---
+    # 在任何更新发生前，克隆一份原始的 SBERT Anchors
+    # 这些是我们的"北极星"，永远不应该被修改
+    fixed_sbert_1 = c1.anchor_embeddings.clone().cpu()
+    fixed_sbert_2 = c2.anchor_embeddings.clone().cpu()
+
+    # 转换为字典，供评估函数使用
+    sb_emb1 = to_dict(c1.dataset.ids, fixed_sbert_1)
+    sb_emb2 = to_dict(c2.dataset.ids, fixed_sbert_2)
 
     for r in range(rounds + 1):
-        # 动态阈值
+        # 动态阈值 & 动态轮次
         current_threshold = get_dynamic_threshold(
             threshold_start, base_threshold, rounds, r)
-
-        # 1. 动态训练轮次 (Curriculum Epochs)
-        # Round 0: 需要从头训练 GCN，给足 100 轮
-        # Round > 0: 只是微调适应新锚点，给 20 轮足矣 (配合早停)
+        # Round 0 给足 100 轮让 GCN 收敛，后续轮次只需 20 轮微调
         current_epochs = cfg.task.federated.local_epochs if r == 0 else 20
 
         log.info(
             f"\n{'='*40}\n🏗️  [Structure] Round {r}/{rounds} (Thresh: {current_threshold:.4f} | Epochs: {current_epochs})\n{'='*40}")
 
-        # --- Step 1: 训练 (Train) ---
+        # ===============================================
+        # Step 1: 训练 (Train)
+        # ===============================================
         log.info(f"   🚀 Training GCN on current anchors...")
-
-        # 传入动态轮次
         w1, l1 = c1.train(custom_epochs=current_epochs)
         log.info(f"   📉 C1 Loss: {l1:.6f}")
-
         w2, l2 = c2.train(custom_epochs=current_epochs)
         log.info(f"   📉 C2 Loss: {l2:.6f}")
 
-        # --- Step 2: 聚合 (Aggregate) ---
+        # ===============================================
+        # Step 2: 聚合 (Aggregate)
+        # ===============================================
         server.aggregate([w1, w2])
         global_shared = server.get_global_weights()
         c1.model.load_shared_state_dict(global_shared)
         c2.model.load_shared_state_dict(global_shared)
         dm.clean_memory()
 
-        # --- Step 3: 评估 (Eval) ---
+        # ===============================================
+        # Step 3: 评估 (Eval - Score Fusion)
+        # ===============================================
         struct_emb1 = c1.get_embeddings()
         struct_emb2 = c2.get_embeddings()
 
         st_dict1 = to_dict(c1.dataset.ids, struct_emb1)
         st_dict2 = to_dict(c2.dataset.ids, struct_emb2)
 
-        # 评估依然使用融合特征 (这是 Inference trick，不影响 Training)
-        log.info(f"   📊 Eval [Fusion Alpha={alpha}]...")
-        fused_1 = _fuse_embeddings(st_dict1, sb_emb1, alpha)
-        fused_2 = _fuse_embeddings(st_dict2, sb_emb2, alpha)
-
-        h_f, m_f = eval_alignment(fused_1, fused_2, test_pairs, device='cpu')
+        log.info(f"   📊 Eval [Score Fusion Alpha={alpha}]...")
+        # 传入 fixed SBERT 字典，确保评估标准统一
+        h_f, m_f = eval_alignment(
+            st_dict1, st_dict2, test_pairs,
+            sbert1_dict=sb_emb1, sbert2_dict=sb_emb2,
+            alpha=alpha, device='cpu'
+        )
         log.info(f"   🏆 Result R{r}: Hits@1={h_f[1]:.2f}% | MRR={m_f:.4f}")
         results.append({"round": r, "hits1": h_f[1], "mrr": m_f})
 
         if r == rounds:
             break
 
-        # --- Step 4: 挖掘 (Mine - Pure Structure) ---
-        # [关键修改] 使用纯 GCN 结构特征进行挖掘，而非融合特征
-        # 这样能挖掘到那些 "语义上不像，但结构上很像" 的互补样本
+        # ===============================================
+        # Step 4: 挖掘 (Mine - Pure GCN)
+        # ===============================================
         log.info(
-            f"   💎 Generating Structure-driven Pseudo-labels (Pure GCN, Thresh={current_threshold:.4f})...")
+            f"   💎 Generating Pseudo-labels (GCN Mining, Thresh={current_threshold:.4f})...")
 
+        # 使用 GCN 结构向量发现潜在对齐
+        # 这一步是为了找出那些 "SBERT 没看出来，但结构上很像" 的实体
         pairs_idx = PseudoLabelGenerator.generate(
-            struct_emb1,  # 纯 GCN 输出
-            struct_emb2,  # 纯 GCN 输出
-            threshold=current_threshold,
-            device='cpu'  # 保持在 CPU 计算相似度，防 OOM
+            struct_emb1, struct_emb2,
+            threshold=current_threshold, device='cpu'
         )
 
-        log.info(f"   Found {len(pairs_idx)} new pairs for anchor expansion.")
+        # ===============================================
+        # Step 5: 语义一致性过滤 (Semantic Filter)
+        # ===============================================
+        filtered_pairs = []
+        # 语义底线：如果 SBERT 相似度低于 0.3，说明语义完全不沾边，判定为结构假阳性
+        semantic_filter_thresh = 0.3
 
         if len(pairs_idx) > 0:
-            p_idx1 = [p[0] for p in pairs_idx]
-            p_idx2 = [p[1] for p in pairs_idx]
+            # 批量操作加速
+            p1 = torch.tensor([p[0] for p in pairs_idx])
+            p2 = torch.tensor([p[1] for p in pairs_idx])
 
-            # 将对方的 Structure Embedding 作为新的 Teacher 信号
-            new_anchors_for_c1 = struct_emb2[p_idx2]
-            new_anchors_for_c2 = struct_emb1[p_idx1]
+            # 取出对应的 Fixed SBERT 向量
+            s1_vecs = F.normalize(fixed_sbert_1[p1], p=2, dim=1)
+            s2_vecs = F.normalize(fixed_sbert_2[p2], p=2, dim=1)
+
+            # 计算成对余弦相似度
+            sem_sims = (s1_vecs * s2_vecs).sum(dim=1)
+
+            # 过滤：保留语义相似度 > 0.3 的对子
+            mask = sem_sims > semantic_filter_thresh
+            valid_indices = torch.nonzero(mask).squeeze()
+
+            # 处理 Tensor 维度边缘情况
+            if valid_indices.numel() > 0:
+                if valid_indices.ndim == 0:  # 只有一个元素时
+                    filtered_pairs.append(pairs_idx[valid_indices.item()])
+                else:
+                    for idx in valid_indices.tolist():
+                        filtered_pairs.append(pairs_idx[idx])
+
+            removed_count = len(pairs_idx) - len(filtered_pairs)
+            log.info(
+                f"   🔍 Semantic Filter: Checked {len(pairs_idx)} pairs -> Kept {len(filtered_pairs)} pairs. (Removed {removed_count} noise)")
+        else:
+            log.warning("   ⚠️ No structural pairs found to filter.")
+
+        # ===============================================
+        # Step 6: 更新锚点 (Update - Lock to SBERT)
+        # ===============================================
+        if len(filtered_pairs) > 0:
+            p_idx1 = [p[0] for p in filtered_pairs]
+            p_idx2 = [p[1] for p in filtered_pairs]
+
+            # C1 的新目标：既然 p_idx1 对应 p_idx2，那就让 p_idx1 去学 p_idx2 的 SBERT 向量
+            # 这样保证了目标永远在语义空间内，不会发生 GCN 互卷导致的漂移
+            new_anchors_for_c1 = fixed_sbert_2[p_idx2]
+            new_anchors_for_c2 = fixed_sbert_1[p_idx1]
 
             c1.update_anchors(p_idx1, new_anchors_for_c1)
             c2.update_anchors(p_idx2, new_anchors_for_c2)
-        else:
-            log.warning("   ⚠️ No new anchors found.")
 
-    # Save and Log (Final)
+            log.info(
+                f"   ✅ Anchors Expanded: +{len(filtered_pairs)} pairs (Targets locked to Fixed SBERT).")
+        else:
+            log.warning("   ⚠️ No new anchors added this round.")
+
+    # Save
     if cfg.task.checkpoint.save_best:
         server.save_model(suffix=f"structure_round{rounds}")
     log_experiment_result(cfg.experiment_name,
