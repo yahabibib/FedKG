@@ -45,3 +45,40 @@ class PseudoLabelGenerator:
                     pairs.append((i, j))
 
         return pairs
+
+    @staticmethod
+    def generate_fusion(emb_gcn1, emb_sem1, emb_gcn2, emb_sem2, alpha, threshold=0.85, device='cpu'):
+        """
+        GCN + SBERT 融合生成伪标签 (GCN Training 的关键策略)。
+
+        :param alpha: 融合权重 (Alpha * GCN + (1-Alpha) * SBERT)
+        """
+        # 1. 显式转到 CPU
+        e_gcn1, e_sem1 = emb_gcn1.to(device), emb_sem1.to(device)
+        e_gcn2, e_sem2 = emb_gcn2.to(device), emb_sem2.to(device)
+
+        # 2. 归一化
+        e_gcn1, e_gcn2 = F.normalize(
+            e_gcn1, p=2, dim=1), F.normalize(e_gcn2, p=2, dim=1)
+        e_sem1, e_sem2 = F.normalize(
+            e_sem1, p=2, dim=1), F.normalize(e_sem2, p=2, dim=1)
+
+        # 3. 计算相似度矩阵 (GCN Sim + SBERT Sim)
+        sim_gcn = torch.mm(e_gcn1, e_gcn2.T)
+        sim_sem = torch.mm(e_sem1, e_sem2.T)
+
+        # 4. 融合相似度
+        sim_fusion = (alpha * sim_gcn) + ((1.0 - alpha) * sim_sem)
+
+        # 5. 找互为最近邻 (MNN Check)
+        vals1, idx1 = sim_fusion.max(dim=1)
+        _, idx2 = sim_fusion.max(dim=0)
+
+        pairs = []
+        for i in range(len(idx1)):
+            j = idx1[i].item()
+            if idx2[j].item() == i:  # MNN Check
+                if vals1[i] > threshold:
+                    pairs.append((i, j))
+
+        return pairs

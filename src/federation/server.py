@@ -1,6 +1,7 @@
-# src/core/server.py
+# src/federation/server.py
 import torch
 from sentence_transformers import SentenceTransformer
+from src.models.projectors.mlp import MLPProjector
 from collections import OrderedDict
 import os
 import logging
@@ -11,32 +12,47 @@ log = logging.getLogger(__name__)
 class Server:
     def __init__(self, cfg):
         self.cfg = cfg
-        # Server 永远驻留 CPU
-        log.info("[Server] Initializing on CPU...")
-        self.global_model = SentenceTransformer(
-            cfg.task.model.name, device='cpu')
+        self.task_type = cfg.task.type
+        log.info(f"[Server] Initializing for task: {self.task_type} on CPU...")
+
+        if self.task_type == 'sbert':
+            # Phase 1: SBERT Model
+            model_name = cfg.task.model.name
+            self.global_model = SentenceTransformer(model_name, device='cpu')
+
+        elif self.task_type == 'structure':
+            # Phase 2: MLP Projector (Shared Component)
+            # 参数需要从 config 中获取
+            input_dim = cfg.task.model.gcn_hidden
+            output_dim = 768  # SBERT dim
+            dropout = cfg.task.model.dropout
+
+            self.global_model = MLPProjector(input_dim, output_dim, dropout)
+        else:
+            raise ValueError(f"Unknown task type: {self.task_type}")
 
     def aggregate(self, client_weights_list):
         """
         FedAvg 聚合策略
-        :param client_weights_list: List[OrderedDict] - 客户端 state_dict 列表
         """
         if not client_weights_list:
             return None
 
-        # log.info(f"[Server] Aggregating parameters from {len(client_weights_list)} clients...")
         avg_weights = OrderedDict()
-
-        # 获取第一个客户端的 keys 作为基准
         keys = client_weights_list[0].keys()
 
         for key in keys:
-            # 确保所有 tensor 都在 CPU 上进行平均
+            # 确保所有 tensor 都在 CPU 上进行处理
             tensors = [w[key].to('cpu') for w in client_weights_list]
-            # Stack 后求平均
-            avg_weights[key] = torch.stack(tensors).mean(dim=0)
 
-        # 更新全局模型
+            # [核心修复] 针对整数类型 (如 BatchNorm 的 num_batches_tracked) 做特殊处理
+            if torch.is_floating_point(tensors[0]):
+                avg_weights[key] = torch.stack(tensors).mean(dim=0)
+            else:
+                # 整数不能直接 mean，先转 float 求均值，再转回 long
+                avg_weights[key] = torch.stack(
+                    tensors).float().mean(dim=0).long()
+
         self.global_model.load_state_dict(avg_weights)
         return avg_weights
 
@@ -44,15 +60,22 @@ class Server:
         return self.global_model.state_dict()
 
     def save_model(self, suffix="best"):
-        """保存 SBERT 全局模型 (含 Config 和 Tokenizer)"""
+        """保存全局模型"""
         save_dir = os.path.join(
             self.cfg.task.checkpoint.save_dir,
-            f"sbert_{self.cfg.task.strategy.text_mode}_{suffix}"
+            f"{self.task_type}_{suffix}"
         )
 
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
 
         log.info(f"💾 Saving global model to: {save_dir}")
-        self.global_model.save(save_dir)
+
+        if self.task_type == 'sbert':
+            self.global_model.save(save_dir)
+        else:
+            # 对于 PyTorch Module (MLP)，保存 state_dict
+            torch.save(self.global_model.state_dict(),
+                       os.path.join(save_dir, "model.pth"))
+
         log.info("✅ Model saved successfully!")

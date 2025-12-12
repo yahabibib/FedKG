@@ -1,0 +1,11 @@
+# configs/system/mac_gcn.yaml
+name: "mac_mps_gcn"
+device: "mps"
+fallback_device: "cpu"
+
+memory:
+  offload_to_cpu: true
+  empty_cache_freq: 0
+
+# GCN 比较轻量，可以开很大
+max_batch_size: 2048

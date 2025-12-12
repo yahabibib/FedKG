@@ -1,22 +1,32 @@
 # configs/task/structure_train.yaml
 name: "structure_alignment"
-type: "structure"  # main.py 根据这个切换流程
+type: "structure"
 
-# 指定 Phase 1 训练好的 SBERT 路径 (必须修改为你实际保存的路径)
+# [修复] 补全 strategy 字段，包含伪标签阈值
+strategy:
+  text_mode: "structure_phase2"  # 占位符
+  pseudo_threshold: 0.95        # [新增] GCN训练后，伪标签阈值应设得更高，以确保锚点的结构可靠性
+
+# 指定 Phase 1 训练好的 SBERT 路径
+# 请确保这个路径下有 config.json 和 pytorch_model.bin
 sbert_checkpoint: "checkpoints/sbert_mixed_round5"
 
 model:
-    gcn_dim: 300       # 节点初始特征维度
-    gcn_hidden: 600    # GCN 隐藏层
-    dropout: 0.3
+  gcn_dim: 300       # 初始特征维度
+  gcn_hidden: 600    # 隐藏层/MLP输入维度
+  dropout: 0.3
+  name: "mlp_projector" # 占位符
 
 federated:
-    rounds: 20         # 结构训练通常需要更多轮次
-    local_epochs: 5
-    batch_size: 512    # GCN 训练比较快，Batch 可以大一点
-    lr: 5e-4
-    margin: 0.4        # MarginRankingLoss 的参数
+  rounds: 10         # 总迭代次数
+  local_epochs: 100   # 本地训练强度
+  batch_size: 512
+  lr: 5e-4
+  margin: 0.4
 
-# 评估时的融合权重
 eval:
-    alpha: 0.42        # 0.42 GCN + 0.58 SBERT
+  alpha: 0.42        # 融合权重
+
+checkpoint:
+  save_dir: "checkpoints/"
+  save_best: true

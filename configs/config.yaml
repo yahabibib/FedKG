@@ -1,18 +1,17 @@
 # configs/config.yaml
 
-# 默认配置组合
 defaults:
-  - system: mac_optimized   # 默认加载 Mac 优化策略
-  - data: dbp15k            # 默认数据集
-  - task: sbert_mixed       # 默认任务
-  - _self_                  # 允许主配置覆盖子配置
+  - system: mac_optimized
+  - data: dbp15k
+  - task: sbert_mixed
+  - _self_
 
-# 全局通用设置
 seed: 42
 project_name: "FedAnchor_v2"
-experiment_name: "${task.name}_${task.text_mode}_${now:%Y%m%d_%H%M%S}"
 
-# Hydra 输出目录管理 (日志和 checkpoints 会自动保存在这里)
+# [修复] 修正引用路径为 ${task.strategy.text_mode}
+experiment_name: "${task.name}_${task.strategy.text_mode}_${now:%Y%m%d_%H%M%S}"
+
 hydra:
   run:
     dir: outputs/${experiment_name}
