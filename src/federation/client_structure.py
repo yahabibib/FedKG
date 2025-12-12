@@ -162,3 +162,33 @@ class ClientStructure:
             embs = self.model(self.adj)
         self.model.to('cpu')
         return embs.cpu()
+
+    def update_anchors(self, indices, new_embeddings):
+        """
+        更新本地训练的锚点目标 (Self-training update)
+        :param indices: 需要更新的实体索引列表 (List or Tensor)
+        :param new_embeddings: 新的目标向量 (Tensor)
+        """
+        # 确保数据在设备上
+        if isinstance(indices, list):
+            indices = torch.tensor(indices, device=self.device)
+        else:
+            indices = indices.to(self.device)
+
+        new_embeddings = new_embeddings.to(self.device)
+
+        # 更新 anchor_embeddings (注意: anchor_embeddings 初始是在 CPU 的，这里要看你训练时的策略)
+        # 如果 self.anchor_embeddings 在 CPU，这里需要 copy 回去，或者训练时临时覆盖
+        # 建议方案：维护一个 mask 或 update 字典
+
+        # 简单移植 main 分支逻辑 (假设 anchor_embeddings 已上载到 GPU 或支持索引更新)
+        # 注意：原 main 分支是直接修改 self.sbert_target
+        # 这里需要适配:
+        self.anchor_embeddings = self.anchor_embeddings.to(
+            self.device)  # 确保在修改前在同一设备
+        self.anchor_embeddings[indices] = new_embeddings
+
+        # 重新生成训练索引 (所有非零/有效的 anchor 都可以作为训练数据)
+        # 或者直接将 indices 加入 train_indices
+        log.info(
+            f"[{self.client_id}] Updated {len(indices)} anchors via pseudo-labels.")

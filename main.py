@@ -178,52 +178,79 @@ def run_sbert_workflow(cfg, server, c1, c2, test_pairs, dm):
 
 def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
     """
-    Phase 2: 结构训练工作流 (GCN Training) - 含融合伪标签和课程学习
+    Phase 2: 结构训练工作流 (GCN Training) - 修复版
+    逻辑顺序: Train(基于现有锚点) -> Aggregate -> Eval -> Mine(为下一轮准备)
     """
     results = []
     rounds = cfg.task.federated.rounds
     alpha = cfg.task.eval.alpha
-    base_threshold = cfg.task.strategy.pseudo_threshold  # 0.95
+    base_threshold = cfg.task.strategy.pseudo_threshold
 
-    # 阈值课程学习参数: 0.70 -> 0.95 (降低起点，确保 Round 1 能找到伪标签)
-    threshold_start = 0.70  # <--- 关键修复：降低起始阈值
+    # 降低起始阈值，给第一轮更多机会
+    threshold_start = 0.70
 
-    # 获取 SBERT 锚点 (Primary Anchor Set)
+    # 获取初始 SBERT 锚点用于融合计算
     sb_emb1 = to_dict(c1.dataset.ids, c1.anchor_embeddings)
     sb_emb2 = to_dict(c2.dataset.ids, c2.anchor_embeddings)
 
     for r in range(rounds + 1):
-        # 动态计算阈值 (课程学习)
+        # 动态计算阈值
         current_threshold = get_dynamic_threshold(
             threshold_start, base_threshold, rounds, r)
+
         log.info(
             f"\n{'='*40}\n🏗️  [Structure] Round {r}/{rounds} (Thresh: {current_threshold:.4f})\n{'='*40}")
 
-        # --- Step 1: 推理 (Inference) ---
+        # =================================================
+        # 1. 训练 (Train) & 聚合 (Aggregate)
+        # =================================================
+        # [核心修复] 无论是否挖掘到新标签，都必须基于现有锚点训练 GCN
+        # Round 0 时，这里会利用初始的 SBERT 锚点把随机 GCN 训练成有意义的形状
+        log.info("   🚀 Training GCN on current anchors...")
+        w1, l1 = c1.train()
+        log.info(f"   📉 C1 Loss: {l1:.6f}")
+        w2, l2 = c2.train()
+        log.info(f"   📉 C2 Loss: {l2:.6f}")
+
+        # 聚合更新
+        server.aggregate([w1, w2])
+        global_shared = server.get_global_weights()
+        c1.model.load_shared_state_dict(global_shared)
+        c2.model.load_shared_state_dict(global_shared)
+
+        # 清理显存
+        dm.clean_memory()
+
+        # =================================================
+        # 2. 评估 (Eval)
+        # =================================================
+        # 获取训练后的 Embeddings
         struct_emb1 = c1.get_embeddings()
         struct_emb2 = c2.get_embeddings()
 
         st_dict1 = to_dict(c1.dataset.ids, struct_emb1)
         st_dict2 = to_dict(c2.dataset.ids, struct_emb2)
 
-        # --- Step 2: 融合评估 (Fusion) ---
         log.info(f"   📊 Eval [Fusion Alpha={alpha}]...")
         fused_1 = _fuse_embeddings(st_dict1, sb_emb1, alpha)
         fused_2 = _fuse_embeddings(st_dict2, sb_emb2, alpha)
 
         h_f, m_f = eval_alignment(fused_1, fused_2, test_pairs, device='cpu')
 
+        # 记录结果
         log.info(f"   🏆 Result R{r}: Hits@1={h_f[1]:.2f}% | MRR={m_f:.4f}")
         results.append({"round": r, "hits1": h_f[1], "mrr": m_f})
 
         if r == rounds:
             break
 
-        # --- Step 3: 策略 - GCN + SBERT 融合驱动的伪标签生成 ---
+        # =================================================
+        # 3. 策略挖掘 (Mine & Update) - 为下一轮做准备
+        # =================================================
         log.info(
             f"   융 Generating Fusion-driven Pseudo-labels (Alpha={alpha}, Thresh={current_threshold:.4f})...")
 
-        # 核心：使用融合相似度发现新的高质量锚点
+        # 使用训练后的 Struct Embedding 进行挖掘
         fusion_pairs_idx = PseudoLabelGenerator.generate_fusion(
             struct_emb1, c1.anchor_embeddings,
             struct_emb2, c2.anchor_embeddings,
@@ -235,36 +262,22 @@ def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
         log.info(
             f"   Found {len(fusion_pairs_idx)} new pairs for anchor expansion.")
 
-        if len(fusion_pairs_idx) < 50:
-            log.warning(
-                "   ⚠️ Too few fusion-driven anchors, skipping training.")
-            continue
+        if len(fusion_pairs_idx) > 0:
+            p_idx1 = [p[0] for p in fusion_pairs_idx]
+            p_idx2 = [p[1] for p in fusion_pairs_idx]
 
-        # --- Step 4: 锚点扩展与训练 (Train) ---
-        p_idx1 = [p[0] for p in fusion_pairs_idx]
-        p_idx2 = [p[1] for p in fusion_pairs_idx]
+            # 提取对端训练好的 Structure Embedding 作为新的 Teacher 信号
+            # 注意：这里使用 struct_emb (GCN输出) 还是 fused (融合) 取决于策略
+            # 原论文通常是用 Structure Embedding 做互监督
+            new_anchors_for_c1 = struct_emb2[p_idx2]
+            new_anchors_for_c2 = struct_emb1[p_idx1]
 
-        # 目标信号：使用 GCN 的输出作为新的 Teacher 信号 (动态锚点)
-        new_anchors_for_c1 = struct_emb2[p_idx2]
-        new_anchors_for_c2 = struct_emb1[p_idx1]
-
-        # 1. 扩展 Client 的本地锚点集
-        c1.update_anchors(p_idx1, new_anchors_for_c1)
-        c2.update_anchors(p_idx2, new_anchors_for_c2)
-
-        # 2. 训练 GCN (本地 Epochs=10)
-        w1, l1 = c1.train()
-        log.info(f"   📉 C1 Loss: {l1:.6f}")
-        w2, l2 = c2.train()
-        log.info(f"   📉 C2 Loss: {l2:.6f}")
-
-        # 5. Aggregate
-        server.aggregate([w1, w2])
-        global_shared = server.get_global_weights()
-        c1.model.load_shared_state_dict(global_shared)
-        c2.model.load_shared_state_dict(global_shared)
-
-        dm.clean_memory()
+            # 更新 Client 的本地锚点集 (这会影响下一轮的 Train)
+            c1.update_anchors(p_idx1, new_anchors_for_c1)
+            c2.update_anchors(p_idx2, new_anchors_for_c2)
+        else:
+            log.info(
+                "   ⚠️ No new anchors found, keeping previous anchors for next round.")
 
     # Save and Log (Final)
     if cfg.task.checkpoint.save_best:
