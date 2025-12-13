@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from sentence_transformers import SentenceTransformer
 import logging
-from tqdm import tqdm
+from tqdm import tqdm  # [Check] 确保导入 tqdm
 
 from src.models.decoupled import DecoupledModel
 from src.utils.graph import build_adjacency_matrix
@@ -77,10 +77,9 @@ class ClientStructure:
 
         # 直接覆盖：这意味着我们相信 Peer 的结构推断优于初始的 SBERT
         self.anchor_embeddings[indices] = new_embeddings
-        # log.info(f"[{self.client_id}] Updated anchors for {len(indices)} entities.")
 
     def train(self, custom_epochs=None):
-        """标准 GCN 训练 (带早停)"""
+        """标准结构训练 (带进度条和早停)"""
         # 支持外部传入动态 Epochs
         epochs = custom_epochs if custom_epochs is not None else self.cfg.task.federated.local_epochs
 
@@ -108,7 +107,13 @@ class ClientStructure:
             epoch_loss_sum = 0.0
             steps = 0
 
-            for i in range(0, n_samples, batch_size):
+            # [新增] 进度条包装
+            # desc 显示当前 Client 和 Epoch
+            pbar = tqdm(range(0, n_samples, batch_size),
+                        desc=f"[{self.client_id}] Ep {epoch+1}/{epochs}",
+                        leave=False)
+
+            for i in pbar:
                 idx = perm[i: i+batch_size]
                 batch_ids = self.train_indices[idx].to(self.device)
 
@@ -117,7 +122,6 @@ class ClientStructure:
                 struct_batch = output_emb[batch_ids]
 
                 # Target: 这里使用的是 self.anchor_embeddings
-                # 在互学习模式下，这部分 target 会随着轮次更新为 Peer 的 Structure Output
                 target_batch = self.anchor_embeddings[batch_ids.cpu()].to(
                     self.device)
 
@@ -125,10 +129,12 @@ class ClientStructure:
                 pos_sim = F.cosine_similarity(struct_batch, target_batch)
 
                 with torch.no_grad():
+                    # 简单负采样逻辑 (Batch内)
                     sim_mat = torch.mm(F.normalize(
                         struct_batch), F.normalize(target_batch).T)
                     sim_mat.fill_diagonal_(-2.0)
                     hard_neg_idx = sim_mat.argmax(dim=1)
+
                 neg_target = target_batch[hard_neg_idx]
                 neg_sim = F.cosine_similarity(struct_batch, neg_target)
 
@@ -140,6 +146,9 @@ class ClientStructure:
 
                 epoch_loss_sum += loss.item()
                 steps += 1
+
+                # [新增] 实时显示 Loss
+                pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
             avg_loss = epoch_loss_sum / max(1, steps)
 
