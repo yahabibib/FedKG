@@ -1,36 +1,51 @@
 # src/models/decoupled.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .encoders.gcn import GCNEncoder
+from .encoders.gat import GATEncoder  # [新增] 导入 GAT
 from .projectors.mlp import MLPProjector
 
 
 class DecoupledModel(nn.Module):
     """
     FedAnchor 核心模型架构：
-    组合 Private Encoder 和 Shared Projector。
+    组合 Private Encoder (GCN/GAT) 和 Shared Projector (MLP)。
     """
 
     def __init__(self, cfg, num_entities):
         """
         :param cfg: Hydra 配置对象 (cfg.task.model)
-        :param num_entities: 实体数量 (用于初始化 Encoder)
+        :param num_entities: 实体数量
         """
         super(DecoupledModel, self).__init__()
 
         # 参数解包
         feature_dim = cfg.gcn_dim
         hidden_dim = cfg.gcn_hidden
-        output_dim = 768  # SBERT 维度，通常固定，也可以放配置里
+        output_dim = 768
         dropout = cfg.dropout
 
-        # 1. 初始化私有编码器 (Private)
-        self.encoder = GCNEncoder(
-            num_entities=num_entities,
-            feature_dim=feature_dim,
-            hidden_dim=hidden_dim,
-            dropout=dropout
-        )
+        # [核心修改] 根据配置选择 Encoder 类型
+        # 默认为 'gcn' 以兼容旧配置
+        encoder_type = getattr(cfg, 'encoder_name', 'gcn').lower()
+
+        if encoder_type == 'gat':
+            # print(f"   [Model] Initializing Private Encoder: GAT (Attention)")
+            self.encoder = GATEncoder(
+                num_entities=num_entities,
+                feature_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                dropout=dropout
+            )
+        else:
+            # print(f"   [Model] Initializing Private Encoder: GCN (Standard)")
+            self.encoder = GCNEncoder(
+                num_entities=num_entities,
+                feature_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                dropout=dropout
+            )
 
         # 2. 初始化共享投影器 (Shared)
         self.projector = MLPProjector(
@@ -41,7 +56,7 @@ class DecoupledModel(nn.Module):
 
     def forward(self, adj):
         """
-        完整前向传播：Adjacency -> Encoder -> Features -> Projector -> Embeddings
+        完整前向传播
         """
         # 1. 提取结构特征
         struct_features = self.encoder(adj)
@@ -49,30 +64,17 @@ class DecoupledModel(nn.Module):
         # 2. 映射语义空间
         semantic_embeddings = self.projector(struct_features)
 
-        return semantic_embeddings
+        # [关键修复] 强制归一化，防止特征坍缩
+        # 这对于 Cosine Similarity Loss 至关重要
+        return F.normalize(semantic_embeddings, p=2, dim=1)
 
-    # ======================================================
-    #  联邦学习专用接口 (FL Interfaces)
-    # ======================================================
-
+    # ... (后续的 state_dict 相关方法保持不变) ...
+    # 只需要保留下面的 get/load 方法即可
     def get_shared_state_dict(self):
-        """
-        [Client 端调用]
-        只获取需要上传给 Server 的参数 (Projector)。
-        """
-        # 直接返回子模块的 state_dict，不用担心 key 的前缀问题
         return self.projector.state_dict()
 
     def load_shared_state_dict(self, shared_state):
-        """
-        [Client 端调用]
-        加载来自 Server 的全局参数。
-        """
         self.projector.load_state_dict(shared_state)
 
     def get_private_state_dict(self):
-        """
-        [Client 本地保存用]
-        获取私有参数 (Encoder)。
-        """
         return self.encoder.state_dict()

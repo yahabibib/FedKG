@@ -2,30 +2,29 @@
 name: "structure_alignment"
 type: "structure"
 
-# [修复] 补全 strategy 字段，包含伪标签阈值
 strategy:
-  text_mode: "structure_phase2"  # 占位符
-  pseudo_threshold: 0.95        # [新增] GCN训练后，伪标签阈值应设得更高，以确保锚点的结构可靠性
+  text_mode: "structure_phase2"
+  pseudo_threshold: 0.95
 
-# 指定 Phase 1 训练好的 SBERT 路径
-# 请确保这个路径下有 config.json 和 pytorch_model.bin
+# Phase 1 训练好的 SBERT 路径
 sbert_checkpoint: "checkpoints/sbert_mixed_round5"
 
 model:
-  gcn_dim: 300       # 初始特征维度
-  gcn_hidden: 600    # 隐藏层/MLP输入维度
+  name: "decoupled_model"
+  encoder_name: "gat"  # [修改] 切换为 GAT！
+  gcn_dim: 300
+  gcn_hidden: 600
   dropout: 0.3
-  name: "mlp_projector" # 占位符
 
 federated:
-  rounds: 10         # 总迭代次数
-  local_epochs: 100   # 本地训练强度
+  rounds: 10
+  local_epochs: 100
   batch_size: 512
   lr: 5e-4
   margin: 0.4
 
 eval:
-  alpha: 0.42        # 融合权重
+  alpha: 0.42
 
 checkpoint:
   save_dir: "checkpoints/"
