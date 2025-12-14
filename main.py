@@ -299,18 +299,24 @@ def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
             log.warning("   ⚠️ No new anchors found.")
 
     if cfg.task.checkpoint.save_best:
-        # 1. 保存 Server (Global MLP)
-        server.save_model(suffix=f"structure_round{rounds}")
+        # 获取当前使用的 encoder 名称 (gcn 或 gat)
+        encoder_name = cfg.task.model.encoder_name
 
-        # 2. [新增] 保存 Client 模型 (包含私有 GCN 参数)
-        # 这对后续的 analyze_mining.py 至关重要！
+        # 1. 保存 Server (Global MLP) -> 加上 encoder 后缀
+        server.save_model(suffix=f"structure_{encoder_name}_round{rounds}")
+
+        # 2. 保存 Client 模型 (包含私有 GCN/GAT 参数)
         save_dir = cfg.task.checkpoint.save_dir
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
 
         # 命名格式: c{id}_structure_round{rounds}.pth
-        c1_path = os.path.join(save_dir, f"c1_structure_round{rounds}.pth")
-        c2_path = os.path.join(save_dir, f"c2_structure_round{rounds}.pth")
+        # [修改] 命名格式: c{id}_structure_{encoder}_round{rounds}.pth
+        # 这样 GCN 和 GAT 的权重文件就会分开，不会覆盖
+        c1_path = os.path.join(
+            save_dir, f"c1_structure_{encoder_name}_round{rounds}.pth")
+        c2_path = os.path.join(
+            save_dir, f"c2_structure_{encoder_name}_round{rounds}.pth")
 
         # 获取包含 GCN+MLP 的完整状态字典
         # 注意: get_shared_state_dict 只返回 MLP，我们要用 state_dict() 获取全部

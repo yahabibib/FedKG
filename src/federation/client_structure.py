@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from sentence_transformers import SentenceTransformer
 import logging
-from tqdm import tqdm  # [Check] 确保导入 tqdm
+from tqdm import tqdm
 
 from src.models.decoupled import DecoupledModel
 from src.utils.graph import build_adjacency_matrix
@@ -65,8 +65,6 @@ class ClientStructure:
     def update_anchors(self, indices, new_embeddings):
         """
         [互学习核心] 更新本地锚点
-        :param indices: 需要更新的实体 ID 列表
-        :param new_embeddings: 新的目标向量 (来自 Peer GCN)
         """
         if new_embeddings.device.type != 'cpu':
             new_embeddings = new_embeddings.cpu()
@@ -75,12 +73,10 @@ class ClientStructure:
         if indices.device.type != 'cpu':
             indices = indices.cpu()
 
-        # 直接覆盖：这意味着我们相信 Peer 的结构推断优于初始的 SBERT
         self.anchor_embeddings[indices] = new_embeddings
 
     def train(self, custom_epochs=None):
         """标准结构训练 (带进度条和早停)"""
-        # 支持外部传入动态 Epochs
         epochs = custom_epochs if custom_epochs is not None else self.cfg.task.federated.local_epochs
 
         self.model.to(self.device)
@@ -93,6 +89,13 @@ class ClientStructure:
             self.cfg.task.federated.batch_size)
 
         n_samples = len(self.train_indices)
+
+        # [新增] 从配置中读取是否使用 Hard Mining，默认为 True
+        use_hard_mining = self.cfg.task.federated.get('hard_mining', True)
+        # 第一次打印日志提示
+        if epochs > 0:
+            log.info(
+                f"   [{self.client_id}] Mining Strategy: {'🔥 Hard Negative' if use_hard_mining else '🎲 Random Negative'}")
 
         # 早停参数
         stop_threshold = 0.08
@@ -107,8 +110,6 @@ class ClientStructure:
             epoch_loss_sum = 0.0
             steps = 0
 
-            # [新增] 进度条包装
-            # desc 显示当前 Client 和 Epoch
             pbar = tqdm(range(0, n_samples, batch_size),
                         desc=f"[{self.client_id}] Ep {epoch+1}/{epochs}",
                         leave=False)
@@ -121,21 +122,35 @@ class ClientStructure:
                 output_emb = self.model(self.adj)
                 struct_batch = output_emb[batch_ids]
 
-                # Target: 这里使用的是 self.anchor_embeddings
+                # Target
                 target_batch = self.anchor_embeddings[batch_ids.cpu()].to(
                     self.device)
 
                 # Loss
                 pos_sim = F.cosine_similarity(struct_batch, target_batch)
 
-                with torch.no_grad():
-                    # 简单负采样逻辑 (Batch内)
-                    sim_mat = torch.mm(F.normalize(
-                        struct_batch), F.normalize(target_batch).T)
-                    sim_mat.fill_diagonal_(-2.0)
-                    hard_neg_idx = sim_mat.argmax(dim=1)
+                # --- 负采样策略分支 ---
+                if use_hard_mining:
+                    # [策略 A] Hard Negative Mining
+                    with torch.no_grad():
+                        sim_mat = torch.mm(F.normalize(
+                            struct_batch), F.normalize(target_batch).T)
+                        sim_mat.fill_diagonal_(-2.0)
+                        neg_idx = sim_mat.argmax(dim=1)
+                else:
+                    # [策略 B] Random Negative Mining (In-batch)
+                    # 随机生成一个偏移量，使得每个样本选取 batch 内的其他样本作为负例
+                    curr_bs = struct_batch.size(0)
+                    if curr_bs > 1:
+                        shift = torch.randint(
+                            1, curr_bs, (curr_bs,), device=self.device)
+                        neg_idx = (torch.arange(
+                            curr_bs, device=self.device) + shift) % curr_bs
+                    else:
+                        neg_idx = torch.zeros(
+                            curr_bs, dtype=torch.long, device=self.device)
 
-                neg_target = target_batch[hard_neg_idx]
+                neg_target = target_batch[neg_idx]
                 neg_sim = F.cosine_similarity(struct_batch, neg_target)
 
                 loss = criterion(pos_sim, neg_sim, torch.ones_like(pos_sim))
@@ -147,7 +162,6 @@ class ClientStructure:
                 epoch_loss_sum += loss.item()
                 steps += 1
 
-                # [新增] 实时显示 Loss
                 pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
             avg_loss = epoch_loss_sum / max(1, steps)
