@@ -3,7 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .encoders.gcn import GCNEncoder
-from .encoders.gat import GATEncoder  # [新增] 导入 GAT
+from .encoders.gat import GATEncoder
+from .encoders.sage import SAGEEncoder
 from .projectors.mlp import MLPProjector
 
 
@@ -31,22 +32,28 @@ class DecoupledModel(nn.Module):
         encoder_type = getattr(cfg, 'encoder_name', 'gcn').lower()
 
         if encoder_type == 'gat':
-            # print(f"   [Model] Initializing Private Encoder: GAT (Attention)")
             self.encoder = GATEncoder(
                 num_entities=num_entities,
                 feature_dim=feature_dim,
                 hidden_dim=hidden_dim,
                 dropout=dropout
             )
+        elif encoder_type == 'sage':  # [新增分支]
+            # print(f"   [Model] Initializing Private Encoder: GraphSAGE")
+            self.encoder = SAGEEncoder(
+                num_entities=num_entities,
+                feature_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                dropout=dropout
+            )
         else:
-            # print(f"   [Model] Initializing Private Encoder: GCN (Standard)")
+            # Default to GCN
             self.encoder = GCNEncoder(
                 num_entities=num_entities,
                 feature_dim=feature_dim,
                 hidden_dim=hidden_dim,
                 dropout=dropout
             )
-
         # 2. 初始化共享投影器 (Shared)
         self.projector = MLPProjector(
             input_dim=hidden_dim,
