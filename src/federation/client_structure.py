@@ -22,12 +22,18 @@ class ClientStructure:
         self.dm = device_manager
         self.device = self.dm.main_device
 
-        # 1. 邻接矩阵 (CPU)
-        self.adj = build_adjacency_matrix(
+        # 1. 构建邻接矩阵 & 获取关系信息 (CPU)
+        # [修改] 开启 return_edge_types=True，获取边类型和关系总数
+        # edge_types 用于 RGAT/RGCN，普通 GCN/GAT 会忽略它
+        self.adj, self.edge_types, self.num_rels = build_adjacency_matrix(
             dataset.triples,
             dataset.num_entities,
-            device='cpu'
+            device='cpu',
+            return_edge_types=True
         )
+
+        # 记录图信息
+        # log.info(f"[{client_id}] Graph Built: {dataset.num_entities} nodes, {self.num_rels} relations.")
 
         # 2. Frozen SBERT (用于初始化和语义一致性检查)
         sbert_path = cfg.task.sbert_checkpoint
@@ -39,7 +45,12 @@ class ClientStructure:
         self.anchor_embeddings = self._precompute_anchors()
 
         # 4. 初始化模型
-        self.model = DecoupledModel(cfg.task.model, dataset.num_entities)
+        # [修改] 传入 num_relations，供 RGATEncoder 使用
+        self.model = DecoupledModel(
+            cfg.task.model,
+            dataset.num_entities,
+            num_relations=self.num_rels
+        )
 
         # 训练索引：初始时所有有 SBERT 的实体都是训练集
         self.train_indices = torch.arange(dataset.num_entities)
@@ -105,6 +116,11 @@ class ClientStructure:
         prev_epoch_loss = float('inf')
         total_loss_record = 0.0
 
+        # 确保 edge_types 在正确的设备上 (如果模型在 GPU，这里不需要手动搬，forward 内部处理可能会更灵活)
+        # 为了通用性，我们保持 edge_types 在 CPU，依赖 Model 内部的设备管理
+        # 或者如果你想更高效，可以在这里把它移到 device:
+        # edge_types_device = self.edge_types.to(self.device)
+
         for epoch in range(epochs):
             perm = torch.randperm(n_samples)
             epoch_loss_sum = 0.0
@@ -119,7 +135,9 @@ class ClientStructure:
                 batch_ids = self.train_indices[idx].to(self.device)
 
                 # Forward
-                output_emb = self.model(self.adj)
+                # [修改] 始终传入 self.edge_types
+                # DecoupledModel 会根据当前的 encoder 类型决定是否使用它
+                output_emb = self.model(self.adj, self.edge_types)
                 struct_batch = output_emb[batch_ids]
 
                 # Target
@@ -139,7 +157,6 @@ class ClientStructure:
                         neg_idx = sim_mat.argmax(dim=1)
                 else:
                     # [策略 B] Random Negative Mining (In-batch)
-                    # 随机生成一个偏移量，使得每个样本选取 batch 内的其他样本作为负例
                     curr_bs = struct_batch.size(0)
                     if curr_bs > 1:
                         shift = torch.randint(
@@ -191,6 +208,7 @@ class ClientStructure:
         self.model.to(self.device)
         self.model.eval()
         with torch.no_grad():
-            embs = self.model(self.adj)
+            # [修改] 同样传入 edge_types
+            embs = self.model(self.adj, self.edge_types)
         self.model.to('cpu')
         return embs.cpu()

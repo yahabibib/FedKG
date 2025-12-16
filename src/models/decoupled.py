@@ -4,33 +4,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .encoders.gcn import GCNEncoder
 from .encoders.gat import GATEncoder
+from .encoders.rgat import RGATEncoder
 from .encoders.sage import SAGEEncoder
 from .projectors.mlp import MLPProjector
 
 
 class DecoupledModel(nn.Module):
-    """
-    FedAnchor 核心模型架构：
-    组合 Private Encoder (GCN/GAT) 和 Shared Projector (MLP)。
-    """
-
-    def __init__(self, cfg, num_entities):
-        """
-        :param cfg: Hydra 配置对象 (cfg.task.model)
-        :param num_entities: 实体数量
-        """
+    # [修改] 增加 num_relations 参数
+    def __init__(self, cfg, num_entities, num_relations=0):
         super(DecoupledModel, self).__init__()
 
-        # 参数解包
         feature_dim = cfg.gcn_dim
         hidden_dim = cfg.gcn_hidden
         output_dim = 768
         dropout = cfg.dropout
 
-        # [核心修改] 根据配置选择 Encoder 类型
-        # 默认为 'gcn' 以兼容旧配置
         encoder_type = getattr(cfg, 'encoder_name', 'gcn').lower()
 
+        # --- Encoder 初始化逻辑 ---
         if encoder_type == 'gat':
             self.encoder = GATEncoder(
                 num_entities=num_entities,
@@ -38,8 +29,15 @@ class DecoupledModel(nn.Module):
                 hidden_dim=hidden_dim,
                 dropout=dropout
             )
-        elif encoder_type == 'sage':  # [新增分支]
-            # print(f"   [Model] Initializing Private Encoder: GraphSAGE")
+        elif encoder_type == 'rgat':
+            self.encoder = RGATEncoder(
+                num_entities=num_entities,
+                num_relations=num_relations,  # 必须传
+                feature_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                dropout=dropout
+            )
+        elif encoder_type == 'sage':
             self.encoder = SAGEEncoder(
                 num_entities=num_entities,
                 feature_dim=feature_dim,
@@ -47,36 +45,35 @@ class DecoupledModel(nn.Module):
                 dropout=dropout
             )
         else:
-            # Default to GCN
             self.encoder = GCNEncoder(
                 num_entities=num_entities,
                 feature_dim=feature_dim,
                 hidden_dim=hidden_dim,
                 dropout=dropout
             )
-        # 2. 初始化共享投影器 (Shared)
+
         self.projector = MLPProjector(
             input_dim=hidden_dim,
             output_dim=output_dim,
             dropout=dropout
         )
 
-    def forward(self, adj):
+    def forward(self, adj, edge_types=None):  # [修改] 增加 edge_types 参数
         """
-        完整前向传播
+        前向传播，根据 Encoder 类型自动决定是否使用 edge_types
         """
-        # 1. 提取结构特征
-        struct_features = self.encoder(adj)
+        if isinstance(self.encoder, RGATEncoder):
+            if edge_types is None:
+                raise ValueError("RGATEncoder requires 'edge_types' input!")
+            struct_features = self.encoder(adj, edge_types)
+        else:
+            # GCN, GAT, SAGE 忽略 edge_types
+            struct_features = self.encoder(adj)
 
-        # 2. 映射语义空间
         semantic_embeddings = self.projector(struct_features)
-
-        # [关键修复] 强制归一化，防止特征坍缩
-        # 这对于 Cosine Similarity Loss 至关重要
         return F.normalize(semantic_embeddings, p=2, dim=1)
 
-    # ... (后续的 state_dict 相关方法保持不变) ...
-    # 只需要保留下面的 get/load 方法即可
+    # ... get/load state dict 方法保持不变 ...
     def get_shared_state_dict(self):
         return self.projector.state_dict()
 

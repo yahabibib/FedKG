@@ -4,6 +4,7 @@ import logging
 import os
 import torch
 import torch.nn.functional as F
+import json
 
 # --- 导入组件 ---
 from src.data.dataset import AlignmentTaskData
@@ -230,14 +231,25 @@ def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
         st_dict2 = to_dict(c2.dataset.ids, struct_emb2)
 
         log.info(f"   📊 Eval [Score Fusion Alpha={alpha}]...")
-        # 评估始终以 Fixed SBERT 为基准，保持公平性
+        # [修改] 调用评估，这里 k_values 会使用我们刚才修改后的默认值 [1, 5, 10]
         h_f, m_f = eval_alignment(
             st_dict1, st_dict2, test_pairs,
             sbert1_dict=sb_emb1, sbert2_dict=sb_emb2,
             alpha=alpha, device='cpu'
         )
-        log.info(f"   🏆 Result R{r}: Hits@1={h_f[1]:.2f}% | MRR={m_f:.4f}")
-        results.append({"round": r, "hits1": h_f[1], "mrr": m_f})
+
+        # [新增] 打印详细指标
+        log.info(
+            f"   🏆 Result R{r}: Hits@1={h_f[1]:.2f}% | Hits@5={h_f[5]:.2f}% | Hits@10={h_f[10]:.2f}% | MRR={m_f:.4f}")
+
+        # [新增] 保存详细历史数据
+        results.append({
+            "round": r,
+            "hits1": h_f[1],
+            "hits5": h_f[5],
+            "hits10": h_f[10],
+            "mrr": m_f
+        })
 
         if r == rounds:
             break
@@ -326,6 +338,12 @@ def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
         log.info(f"💾 Saved full client models to:")
         log.info(f"   - {c1_path}")
         log.info(f"   - {c2_path}")
+
+    # [新增] 循环结束后，保存完整的训练历史 (Learning Curve Data)
+    history_path = os.path.join(os.getcwd(), "training_history.json")
+    with open(history_path, 'w') as f:
+        json.dump(results, f, indent=4)
+    log.info(f"📈 Full training history saved to: {history_path}")
 
     log_experiment_result(cfg.experiment_name,
                           cfg.data.name, results[-1], config=cfg)

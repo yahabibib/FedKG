@@ -6,7 +6,7 @@ import torch.nn.functional as F
 log = logging.getLogger(__name__)
 
 
-def eval_alignment(emb1_dict, emb2_dict, pairs, k_values=[1, 10, 50],
+def eval_alignment(emb1_dict, emb2_dict, pairs, k_values=[1, 5, 10],
                    sbert1_dict=None, sbert2_dict=None, alpha=1.0, device='cpu'):
     """
     对齐评估函数 (支持 Score Fusion)
