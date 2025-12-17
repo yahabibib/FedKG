@@ -6,6 +6,7 @@ import torch.optim as optim
 from sentence_transformers import SentenceTransformer
 import logging
 from tqdm import tqdm
+import os
 
 from src.models.decoupled import DecoupledModel
 from src.utils.graph import build_adjacency_matrix
@@ -40,31 +41,70 @@ class ClientStructure:
             dataset.triples, dataset.num_entities, device='cpu', return_edge_types=True
         )
 
-        # 2. 加载 SBERT (Teacher)
-        sbert_path = cfg.task.sbert_checkpoint
-        log.info(f"[{client_id}] Loading Frozen SBERT: {sbert_path}")
-        self.sbert = SentenceTransformer(sbert_path, device='cpu').eval()
+        # --- [优化] SBERT 缓存路径 ---
+        # 缓存文件名包含: 数据集名 + ClientID + SBERT模型名
+        # 例如: dbp15k_C1_paraphrase-multilingual_anchors.pt
+        cache_dir = "data/cache"
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
 
-        # 3. 预计算 Anchors
+        sbert_name = cfg.task.sbert_checkpoint.replace("/", "_")
+        self.cache_path = os.path.join(
+            cache_dir,
+            f"{cfg.data.name}_{client_id}_{sbert_name}_anchors.pt"
+        )
+
+        # 2. 智能加载 SBERT
+        # 如果缓存存在，就不需要加载 SBERT 模型了，直接加载 Embedding，巨省内存！
+        if os.path.exists(self.cache_path):
+            log.info(
+                f"[{client_id}] ✅ Found cached SBERT anchors: {self.cache_path}")
+            self.sbert = None  # 此时不需要模型
+        else:
+            log.info(
+                f"[{client_id}] No cache found. Loading SBERT to compute anchors...")
+            self.sbert = SentenceTransformer(
+                cfg.task.sbert_checkpoint, device='cpu').eval()
+
+        # 3. 获取 Anchors (读缓存 或 计算)
         self.anchor_embeddings = self._precompute_anchors()
+
+        # 用完 SBERT 就可以释放了
+        if self.sbert is not None:
+            del self.sbert
+            import gc
+            gc.collect()
 
         # 4. 初始化模型 (Student)
         self.model = DecoupledModel(
             cfg.task.model, dataset.num_entities, self.num_rels)
 
-        # 训练集索引 (全量)
         self.train_indices = torch.arange(dataset.num_entities)
 
     def _precompute_anchors(self):
-        log.info(f"[{self.client_id}] Pre-computing SBERT anchors...")
+        # [方案 A] 读取缓存
+        if os.path.exists(self.cache_path):
+            try:
+                return torch.load(self.cache_path, map_location='cpu')
+            except Exception as e:
+                log.warning(f"⚠️ Failed to load cache: {e}. Re-computing...")
+
+        # [方案 B] 重新计算
+        log.info(f"[{self.client_id}] ⏳ Computing SBERT anchors (First run)...")
         texts = self.dataset.get_text_list(self.dataset.ids, 'desc')
+
         self.sbert.to(self.device)
         with torch.no_grad():
             embs = self.sbert.encode(
                 texts, batch_size=512, convert_to_tensor=True,
-                show_progress_bar=False, device=self.device
+                show_progress_bar=True, device=self.device
             )
         self.sbert.to('cpu')
+
+        # 保存缓存
+        torch.save(embs.cpu(), self.cache_path)
+        log.info(f"[{self.client_id}] 💾 Anchors saved to cache.")
+
         return embs.cpu()
 
     def update_anchors(self, indices, new_embeddings):

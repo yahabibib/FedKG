@@ -297,11 +297,11 @@ def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
                 # 2. 手动执行带偏置的融合 (Manual Biased Fusion)
                 # -------------------------------------------------
                 # C1 Fusion
-                # 获取 Gate 的原始输出 (Alpha)
-                # 注意：这里需要临时构建 Gate 的输入 [struct, sbert]
-                gate_inp_c1 = torch.cat([e1_s, e1_t], dim=1)
-                # 调用模型内的 gate 子模块
-                raw_alpha_c1 = c1.model.gate.to('cpu')(gate_inp_c1)  # [N, 1]
+                # [修复] 直接传两个参数，而不是拼接后的结果
+                # gate_inp_c1 = torch.cat([e1_s, e1_t], dim=1) <--- 删除这一行
+
+                # 调用模型内的 gate 子模块 (传两个参数: struct, sbert)
+                raw_alpha_c1 = c1.model.gate.to('cpu')(e1_s, e1_t)  # [N, 1]
 
                 # 注入偏置并截断 (Clamp)
                 boosted_alpha_c1 = torch.clamp(
@@ -312,8 +312,9 @@ def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
                     boosted_alpha_c1 * e1_s + (1 - boosted_alpha_c1) * e1_t, p=2, dim=1)
 
                 # C2 Fusion (同理)
-                gate_inp_c2 = torch.cat([e2_s, e2_t], dim=1)
-                raw_alpha_c2 = c2.model.gate.to('cpu')(gate_inp_c2)
+                # [修复] 直接传两个参数
+                raw_alpha_c2 = c2.model.gate.to('cpu')(e2_s, e2_t)
+
                 boosted_alpha_c2 = torch.clamp(
                     raw_alpha_c2 + curr_bias, 0.0, 1.0)
                 e2_fused = F.normalize(
@@ -358,7 +359,10 @@ def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
         # 保存最佳模型
         if final_hits1 > best_global_hits1:
             best_global_hits1 = final_hits1
-            server.save_model("best_structure")
+            # 获取当前使用的编码器名称 (如 gcn, rgat)
+            enc_name = cfg.task.model.encoder_name
+            # 保存为: checkpoints/structure_best_rgat (带上名字，互不冲突)
+            server.save_model(f"best_{enc_name}")
 
         # 记录历史
         results_history.append({
