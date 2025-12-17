@@ -1,7 +1,8 @@
 # src/federation/server.py
 import torch
 from sentence_transformers import SentenceTransformer
-from src.models.projectors.mlp import MLPProjector
+# [修改] 引入 SharedArchitecture
+from src.models.decoupled import SharedArchitecture
 from collections import OrderedDict
 import os
 import logging
@@ -21,13 +22,14 @@ class Server:
             self.global_model = SentenceTransformer(model_name, device='cpu')
 
         elif self.task_type == 'structure':
-            # Phase 2: MLP Projector (Shared Component)
-            # 参数需要从 config 中获取
+            # Phase 2: Shared Structure Model (Projector + Gate)
             input_dim = cfg.task.model.gcn_hidden
-            output_dim = 768  # SBERT dim
+            output_dim = 768
             dropout = cfg.task.model.dropout
 
-            self.global_model = MLPProjector(input_dim, output_dim, dropout)
+            # [修改] 初始化 SharedArchitecture 容器
+            self.global_model = SharedArchitecture(
+                input_dim, output_dim, dropout)
         else:
             raise ValueError(f"Unknown task type: {self.task_type}")
 
@@ -39,17 +41,16 @@ class Server:
             return None
 
         avg_weights = OrderedDict()
+        # 现在 keys 是扁平的 (e.g., 'projector.net.0.weight'), 对应的值是 Tensor
         keys = client_weights_list[0].keys()
 
         for key in keys:
             # 确保所有 tensor 都在 CPU 上进行处理
             tensors = [w[key].to('cpu') for w in client_weights_list]
 
-            # [核心修复] 针对整数类型 (如 BatchNorm 的 num_batches_tracked) 做特殊处理
             if torch.is_floating_point(tensors[0]):
                 avg_weights[key] = torch.stack(tensors).mean(dim=0)
             else:
-                # 整数不能直接 mean，先转 float 求均值，再转回 long
                 avg_weights[key] = torch.stack(
                     tensors).float().mean(dim=0).long()
 
@@ -74,7 +75,6 @@ class Server:
         if self.task_type == 'sbert':
             self.global_model.save(save_dir)
         else:
-            # 对于 PyTorch Module (MLP)，保存 state_dict
             torch.save(self.global_model.state_dict(),
                        os.path.join(save_dir, "model.pth"))
 

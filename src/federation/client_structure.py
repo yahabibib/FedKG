@@ -14,201 +14,163 @@ from src.utils.device_manager import DeviceManager
 log = logging.getLogger(__name__)
 
 
+def info_nce_loss(features, targets, temperature=0.07):
+    """
+    [InfoNCE Loss]
+    features: Structure Prediction [B, D]
+    targets: SBERT Ground Truth [B, D]
+    temperature: 越小越尖锐，推荐 0.05-0.1
+    """
+    logits = torch.mm(features, targets.T)
+    logits /= temperature
+    labels = torch.arange(features.size(0)).to(features.device)
+    return F.cross_entropy(logits, labels)
+
+
 class ClientStructure:
-    def __init__(self, client_id, cfg, dataset, device_manager: DeviceManager):
+    def __init__(self, client_id, cfg, dataset, device_manager):
         self.client_id = client_id
         self.cfg = cfg
         self.dataset = dataset
         self.dm = device_manager
         self.device = self.dm.main_device
 
-        # 1. 构建邻接矩阵 & 获取关系信息 (CPU)
-        # [修改] 开启 return_edge_types=True，获取边类型和关系总数
-        # edge_types 用于 RGAT/RGCN，普通 GCN/GAT 会忽略它
+        # 1. 构建图
         self.adj, self.edge_types, self.num_rels = build_adjacency_matrix(
-            dataset.triples,
-            dataset.num_entities,
-            device='cpu',
-            return_edge_types=True
+            dataset.triples, dataset.num_entities, device='cpu', return_edge_types=True
         )
 
-        # 记录图信息
-        # log.info(f"[{client_id}] Graph Built: {dataset.num_entities} nodes, {self.num_rels} relations.")
-
-        # 2. Frozen SBERT (用于初始化和语义一致性检查)
+        # 2. 加载 SBERT (Teacher)
         sbert_path = cfg.task.sbert_checkpoint
-        log.info(f"[{client_id}] Loading Frozen SBERT from: {sbert_path}")
-        self.sbert = SentenceTransformer(sbert_path, device='cpu')
-        self.sbert.eval()
+        log.info(f"[{client_id}] Loading Frozen SBERT: {sbert_path}")
+        self.sbert = SentenceTransformer(sbert_path, device='cpu').eval()
 
-        # 3. 预计算 SBERT Anchors (作为初始训练目标)
+        # 3. 预计算 Anchors
         self.anchor_embeddings = self._precompute_anchors()
 
-        # 4. 初始化模型
-        # [修改] 传入 num_relations，供 RGATEncoder 使用
+        # 4. 初始化模型 (Student)
         self.model = DecoupledModel(
-            cfg.task.model,
-            dataset.num_entities,
-            num_relations=self.num_rels
-        )
+            cfg.task.model, dataset.num_entities, self.num_rels)
 
-        # 训练索引：初始时所有有 SBERT 的实体都是训练集
+        # 训练集索引 (全量)
         self.train_indices = torch.arange(dataset.num_entities)
 
     def _precompute_anchors(self):
-        log.info(f"[{self.client_id}] Pre-computing semantic anchors...")
-        ids = self.dataset.ids
-        texts = self.dataset.get_text_list(ids, mode='desc')
-
+        log.info(f"[{self.client_id}] Pre-computing SBERT anchors...")
+        texts = self.dataset.get_text_list(self.dataset.ids, 'desc')
         self.sbert.to(self.device)
         with torch.no_grad():
             embs = self.sbert.encode(
-                texts,
-                batch_size=self.dm.get_safe_batch_size(64),
-                convert_to_tensor=True,
-                show_progress_bar=True,
-                device=self.device
+                texts, batch_size=512, convert_to_tensor=True,
+                show_progress_bar=False, device=self.device
             )
         self.sbert.to('cpu')
-        self.dm.clean_memory()
         return embs.cpu()
 
     def update_anchors(self, indices, new_embeddings):
         """
-        [互学习核心] 更新本地锚点
+        [修复版] 接收来自对端的结构化伪标签，更新本地目标
+        兼容 List 和 Tensor 类型的 indices
         """
-        if new_embeddings.device.type != 'cpu':
+        # 1. 确保 Embedding 在 CPU
+        if isinstance(new_embeddings, torch.Tensor):
             new_embeddings = new_embeddings.cpu()
-        if not torch.is_tensor(indices):
-            indices = torch.tensor(indices)
-        if indices.device.type != 'cpu':
+
+        # 2. 确保 indices 是 Tensor (以便后续索引操作)
+        if isinstance(indices, list):
+            indices = torch.tensor(indices, dtype=torch.long)
+
+        if isinstance(indices, torch.Tensor):
             indices = indices.cpu()
 
+        # 3. 执行更新
         self.anchor_embeddings[indices] = new_embeddings
 
+    def calc_internal_fidelity(self):
+        """
+        计算内部对齐度 (Internal Fidelity)
+        衡量 Structure Encoder 对本地 SBERT 知识的吸收程度。
+        """
+        self.model.to(self.device).eval()
+        batch_size = 2048
+        total_sim = 0.0
+        n_batches = 0
+
+        with torch.no_grad():
+            struct_full = self.model(self.adj, self.edge_types)  # [N, D]
+
+            num_nodes = struct_full.shape[0]
+            for i in range(0, num_nodes, batch_size):
+                end = min(i + batch_size, num_nodes)
+
+                s_emb = F.normalize(struct_full[i:end], p=2, dim=1)
+                t_emb = F.normalize(
+                    self.anchor_embeddings[i:end].to(self.device), p=2, dim=1)
+
+                sim = F.cosine_similarity(s_emb, t_emb).mean()
+                total_sim += sim.item()
+                n_batches += 1
+
+        self.model.to('cpu')
+        return total_sim / max(1, n_batches)
+
     def train(self, custom_epochs=None):
-        """标准结构训练 (带进度条和早停)"""
+        """
+        纯结构训练 (Pure Structure Training)
+        """
         epochs = custom_epochs if custom_epochs is not None else self.cfg.task.federated.local_epochs
-
-        self.model.to(self.device)
-        self.model.train()
-
-        optimizer = optim.Adam(self.model.parameters(),
-                               lr=self.cfg.task.federated.lr)
-        criterion = nn.MarginRankingLoss(margin=self.cfg.task.federated.margin)
+        temperature = self.cfg.task.federated.get('temperature', 0.07)
         batch_size = self.dm.get_safe_batch_size(
             self.cfg.task.federated.batch_size)
 
-        n_samples = len(self.train_indices)
+        self.model.to(self.device).train()
+        optimizer = optim.Adam(self.model.parameters(),
+                               lr=self.cfg.task.federated.lr)
 
-        # [新增] 从配置中读取是否使用 Hard Mining，默认为 True
-        use_hard_mining = self.cfg.task.federated.get('hard_mining', True)
-        # 第一次打印日志提示
         if epochs > 0:
             log.info(
-                f"   [{self.client_id}] Mining Strategy: {'🔥 Hard Negative' if use_hard_mining else '🎲 Random Negative'}")
+                f"   [{self.client_id}] Strategy: InfoNCE (Tau={temperature}) | Target: SBERT/Peer-Struct")
 
-        # 早停参数
-        stop_threshold = 0.08
-        patience = 3
-        min_delta = 0.005
-        early_stop_counter = 0
-        prev_epoch_loss = float('inf')
-        total_loss_record = 0.0
-
-        # 确保 edge_types 在正确的设备上 (如果模型在 GPU，这里不需要手动搬，forward 内部处理可能会更灵活)
-        # 为了通用性，我们保持 edge_types 在 CPU，依赖 Model 内部的设备管理
-        # 或者如果你想更高效，可以在这里把它移到 device:
-        # edge_types_device = self.edge_types.to(self.device)
+        total_loss = 0.0
+        n_samples = len(self.train_indices)
 
         for epoch in range(epochs):
             perm = torch.randperm(n_samples)
-            epoch_loss_sum = 0.0
+            epoch_loss = 0.0
             steps = 0
 
             pbar = tqdm(range(0, n_samples, batch_size),
-                        desc=f"[{self.client_id}] Ep {epoch+1}/{epochs}",
-                        leave=False)
-
+                        desc=f"Ep {epoch+1}/{epochs}", leave=False)
             for i in pbar:
-                idx = perm[i: i+batch_size]
+                idx = perm[i:i+batch_size]
                 batch_ids = self.train_indices[idx].to(self.device)
 
-                # Forward
-                # [修改] 始终传入 self.edge_types
-                # DecoupledModel 会根据当前的 encoder 类型决定是否使用它
+                # Forward (Pure Structure)
                 output_emb = self.model(self.adj, self.edge_types)
-                struct_batch = output_emb[batch_ids]
+                struct_batch = F.normalize(output_emb[batch_ids], p=2, dim=1)
 
-                # Target
-                target_batch = self.anchor_embeddings[batch_ids.cpu()].to(
-                    self.device)
+                # Target (Anchors)
+                target_batch = F.normalize(
+                    self.anchor_embeddings[batch_ids.cpu()].to(self.device), p=2, dim=1)
 
-                # Loss
-                pos_sim = F.cosine_similarity(struct_batch, target_batch)
-
-                # --- 负采样策略分支 ---
-                if use_hard_mining:
-                    # [策略 A] Hard Negative Mining
-                    with torch.no_grad():
-                        sim_mat = torch.mm(F.normalize(
-                            struct_batch), F.normalize(target_batch).T)
-                        sim_mat.fill_diagonal_(-2.0)
-                        neg_idx = sim_mat.argmax(dim=1)
-                else:
-                    # [策略 B] Random Negative Mining (In-batch)
-                    curr_bs = struct_batch.size(0)
-                    if curr_bs > 1:
-                        shift = torch.randint(
-                            1, curr_bs, (curr_bs,), device=self.device)
-                        neg_idx = (torch.arange(
-                            curr_bs, device=self.device) + shift) % curr_bs
-                    else:
-                        neg_idx = torch.zeros(
-                            curr_bs, dtype=torch.long, device=self.device)
-
-                neg_target = target_batch[neg_idx]
-                neg_sim = F.cosine_similarity(struct_batch, neg_target)
-
-                loss = criterion(pos_sim, neg_sim, torch.ones_like(pos_sim))
+                # InfoNCE Loss
+                loss = info_nce_loss(struct_batch, target_batch, temperature)
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-                epoch_loss_sum += loss.item()
+                epoch_loss += loss.item()
                 steps += 1
-
                 pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
-            avg_loss = epoch_loss_sum / max(1, steps)
+            total_loss = epoch_loss / max(1, steps)
 
-            # 早停检查
-            if avg_loss < stop_threshold:
-                if (prev_epoch_loss - avg_loss) < min_delta:
-                    early_stop_counter += 1
-                    if early_stop_counter >= patience:
-                        log.info(
-                            f"   🛑 [{self.client_id}] Early stop @ Ep {epoch+1} (Loss={avg_loss:.4f})")
-                        total_loss_record = avg_loss
-                        break
-                else:
-                    early_stop_counter = 0
-
-            prev_epoch_loss = avg_loss
-            total_loss_record = avg_loss
+        # 计算 Fidelity
+        fidelity_score = self.calc_internal_fidelity()
 
         if self.dm.is_offload_enabled():
             self.model.to('cpu')
             self.dm.clean_memory()
 
-        return self.model.get_shared_state_dict(), total_loss_record
-
-    def get_embeddings(self):
-        self.model.to(self.device)
-        self.model.eval()
-        with torch.no_grad():
-            # [修改] 同样传入 edge_types
-            embs = self.model(self.adj, self.edge_types)
-        self.model.to('cpu')
-        return embs.cpu()
+        return self.model.get_shared_state_dict(), total_loss, fidelity_score

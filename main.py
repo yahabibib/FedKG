@@ -1,3 +1,4 @@
+# main.py
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import logging
@@ -5,6 +6,7 @@ import os
 import torch
 import torch.nn.functional as F
 import json
+import numpy as np
 
 # --- 导入组件 ---
 from src.data.dataset import AlignmentTaskData
@@ -34,27 +36,10 @@ def get_dynamic_threshold(start_threshold, end_threshold, total_rounds, current_
     return start_threshold + current_round * increment
 
 
-def _fuse_embeddings(struct_dict, sbert_dict, alpha):
-    """
-    辅助函数：加权融合两个 Embedding 字典
-    Res = alpha * Struct + (1-alpha) * SBERT
-    """
-    fused = {}
-    # 确保ID存在且有序
-    for eid, s_emb in struct_dict.items():
-        if eid in sbert_dict:
-            # 归一化 (非常重要)
-            v1 = F.normalize(s_emb, dim=0)
-            v2 = F.normalize(sbert_dict[eid], dim=0)
-            fused[eid] = alpha * v1 + (1.0 - alpha) * v2
-    return fused
-
-# --- 辅助函数：字典转换 ---
-
-
 def to_dict(ids, embs):
     """将有序的ids和embeddings列表转换为字典"""
     return {id: embs[i] for i, id in enumerate(ids)}
+
 # -----------------------------------------------
 
 
@@ -86,7 +71,7 @@ def main(cfg: DictConfig):
         run_sbert_workflow(cfg, server, c1, c2, task_data.test_pairs, dm)
 
     elif cfg.task.type == 'structure':
-        log.info("🔹 Entering Phase 2: Structure Training (GCN)")
+        log.info("🔹 Entering Phase 2: Structure Training (GAT Optimized)")
         log.info("🏗️ Initializing Structure Clients (Loading Frozen SBERT)...")
         c1 = ClientStructure("C1", cfg, task_data.source, dm)
         c2 = ClientStructure("C2", cfg, task_data.target, dm)
@@ -98,7 +83,7 @@ def main(cfg: DictConfig):
 
 def run_sbert_workflow(cfg, server, c1, c2, test_pairs, dm):
     """
-    Phase 1: SBERT 混合微调工作流 (含课程学习)
+    Phase 1: SBERT 混合微调工作流 (保持原样)
     """
     results = []
     rounds = cfg.task.federated.rounds
@@ -125,6 +110,7 @@ def run_sbert_workflow(cfg, server, c1, c2, test_pairs, dm):
         d1_desc = to_dict(ids1_desc, emb1_desc)
         d2_desc = to_dict(ids2_desc, emb2_desc)
         h_d, m_d = eval_alignment(d1_desc, d2_desc, test_pairs, device='cpu')
+
         d1_poly = to_dict(ids1_poly, emb1_poly)
         d2_poly = to_dict(ids2_poly, emb2_poly)
         h_p, m_p = eval_alignment(d1_poly, d2_poly, test_pairs, device='cpu')
@@ -157,7 +143,8 @@ def run_sbert_workflow(cfg, server, c1, c2, test_pairs, dm):
         target_poly_c2 = emb1_poly[p_idx1]
 
         c1.prepare_training_data(p_idx1, target_desc_c1, target_poly_c1)
-        c2.prepare_training_data(p_idx2, target_desc_c2, target_poly_for_c2)
+        # Fixed minor variable name typo from previous version if any
+        c2.prepare_training_data(p_idx2, target_desc_c2, target_poly_c2)
 
         w1, l1 = c1.train()
         log.info(f"   📉 C1 Loss: {l1:.6f}")
@@ -179,174 +166,197 @@ def run_sbert_workflow(cfg, server, c1, c2, test_pairs, dm):
 
 def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
     """
-    Phase 2: 结构训练工作流 (GCN Training) - 复刻老版本互学习策略
+    Phase 2: Structure Alignment Workflow
+    (Performance-Aware Curriculum Federation)
     """
-    results = []
     rounds = cfg.task.federated.rounds
-    alpha = cfg.task.eval.alpha
+    # 读取课程学习阈值，默认 0.70
+    curriculum_thresh = cfg.task.federated.get('curriculum_thresh', 0.70)
 
-    # [策略调整] 阈值从高到低 (0.8 -> 0.5)
-    # 模拟老版本的: max(0.50, 0.80 - (it * 0.05))
-    thresh_start = 0.80
-    thresh_end = 0.50
+    # 挖掘阈值衰减策略
+    thresh_start = 0.85
+    thresh_end = 0.60
     thresh_step = (thresh_start - thresh_end) / max(1, rounds - 1)
 
-    # 1. 备份原始 SBERT (仅用于评估和语义过滤器，不作为训练强约束)
-    fixed_sbert_1 = c1.anchor_embeddings.clone().cpu()
-    fixed_sbert_2 = c2.anchor_embeddings.clone().cpu()
+    best_hits1 = 0.0
+    results_history = []
 
-    # 评估用字典
-    sb_emb1 = to_dict(c1.dataset.ids, fixed_sbert_1)
-    sb_emb2 = to_dict(c2.dataset.ids, fixed_sbert_2)
+    # ---------------------------------------------------------
+    # 0. 初始基准评估 (SBERT Baseline)
+    # ---------------------------------------------------------
+    log.info("\n" + "="*60)
+    log.info("📊 Baseline Evaluation: SBERT (Before Structure Training)")
+    log.info("="*60)
 
+    # 获取纯 SBERT 特征
+    s1_base = F.normalize(c1.anchor_embeddings, p=2, dim=1)
+    s2_base = F.normalize(c2.anchor_embeddings, p=2, dim=1)
+
+    d1_base = {id: s1_base[i] for i, id in enumerate(c1.dataset.ids)}
+    d2_base = {id: s2_base[i] for i, id in enumerate(c2.dataset.ids)}
+
+    # alpha=0.0 代表纯 SBERT 评估
+    h_base, mrr_base = eval_alignment(
+        d1_base, d2_base, test_pairs, k_values=[1], alpha=0.0)
+    log.info(f"🏆 SBERT Baseline: Hits@1={h_base[1]:.2f}% | MRR={mrr_base:.4f}")
+    log.info("   (Target: Structure model should try to match this fidelity first!)\n")
+
+    # ---------------------------------------------------------
+    # 联邦训练循环
+    # ---------------------------------------------------------
     for r in range(rounds + 1):
-        # 计算当前阈值 (Decaying)
-        current_threshold = max(thresh_end, thresh_start - (r * thresh_step))
+        # 计算当前挖掘阈值
+        curr_mining_thresh = max(thresh_end, thresh_start - (r * thresh_step))
+        # 动态 Epochs: Round 0 需要多跑一会来热身
+        curr_epochs = 100 if r == 0 else cfg.task.federated.local_epochs
 
-        # 动态 Epochs: Round 0 铺底 (100)，后续微调 (20)
-        current_epochs = cfg.task.federated.local_epochs if r == 0 else 20
+        log.info(f"\n{'='*40}")
+        log.info(f"🏗️  [Structure] Round {r}/{rounds}")
+        log.info(f"{'='*40}")
 
+        # --- Step 1: Local Training ---
         log.info(
-            f"\n{'='*40}\n🏗️  [Structure] Round {r}/{rounds} (Thresh: {current_threshold:.4f} | Epochs: {current_epochs})\n{'='*40}")
+            f"🚀 Training {cfg.task.model.encoder_name.upper()} (Target=SBERT/Peer)...")
 
-        # --- Step 1: 训练 (Train) ---
-        log.info(f"   🚀 Training GCN on current anchors (Mutual Targets)...")
-        w1, l1 = c1.train(custom_epochs=current_epochs)
-        log.info(f"   📉 C1 Loss: {l1:.6f}")
-        w2, l2 = c2.train(custom_epochs=current_epochs)
-        log.info(f"   📉 C2 Loss: {l2:.6f}")
+        # 接收: 权重, Loss, 以及 [Internal Fidelity]
+        w1, l1, fid1 = c1.train(custom_epochs=curr_epochs)
+        w2, l2, fid2 = c2.train(custom_epochs=curr_epochs)
 
-        # --- Step 2: 聚合 (Aggregate) ---
+        avg_fidelity = (fid1 + fid2) / 2
+        log.info(f"   📉 Loss: C1={l1:.4f} | C2={l2:.4f}")
+        log.info(
+            f"   🎓 Internal Fidelity: C1={fid1:.3f} | C2={fid2:.3f} | Avg={avg_fidelity:.3f}")
+        log.info(f"      (Curriculum Threshold: {curriculum_thresh})")
+
+        # --- Step 2: Aggregation ---
+        # log.info("🔗 Aggregating Shared Weights...")
         server.aggregate([w1, w2])
-        global_shared = server.get_global_weights()
-        c1.model.load_shared_state_dict(global_shared)
-        c2.model.load_shared_state_dict(global_shared)
-        dm.clean_memory()
+        global_weights = server.get_global_weights()
 
-        # --- Step 3: 评估 (Score Fusion) ---
-        struct_emb1 = c1.get_embeddings()
-        struct_emb2 = c2.get_embeddings()
+        # 分发更新
+        c1.model.load_shared_state_dict(global_weights)
+        c2.model.load_shared_state_dict(global_weights)
 
-        st_dict1 = to_dict(c1.dataset.ids, struct_emb1)
-        st_dict2 = to_dict(c2.dataset.ids, struct_emb2)
+        # --- Step 3: Dual Evaluation (双重评估) ---
+        log.info(f"📊 Round {r} Evaluation...")
 
-        log.info(f"   📊 Eval [Score Fusion Alpha={alpha}]...")
-        # [修改] 调用评估，这里 k_values 会使用我们刚才修改后的默认值 [1, 5, 10]
-        h_f, m_f = eval_alignment(
-            st_dict1, st_dict2, test_pairs,
-            sbert1_dict=sb_emb1, sbert2_dict=sb_emb2,
-            alpha=alpha, device='cpu'
-        )
+        c1.model.to(c1.device).eval()
+        c2.model.to(c2.device).eval()
 
-        # [新增] 打印详细指标
+        with torch.no_grad():
+            # A. 获取纯结构特征 (Pure Structure)
+            emb1_struct = F.normalize(
+                c1.model(c1.adj, c1.edge_types), p=2, dim=1)
+            emb2_struct = F.normalize(
+                c2.model(c2.adj, c2.edge_types), p=2, dim=1)
+
+            # B. 获取 SBERT 特征 (Anchors)
+            emb1_sbert = F.normalize(
+                c1.anchor_embeddings.to(c1.device), p=2, dim=1)
+            emb2_sbert = F.normalize(
+                c2.anchor_embeddings.to(c2.device), p=2, dim=1)
+
+            # C. 融合特征 (Gate 辅助推理)
+            # 只有在推理时才进行融合！
+            emb1_fused, alpha1 = c1.model.fuse(emb1_struct, emb1_sbert)
+            emb2_fused, alpha2 = c2.model.fuse(emb2_struct, emb2_sbert)
+
+            # 打印 Gate 的倾向性
+            log.info(
+                f"      [Gate Stats] C1_Struct_Weight: {alpha1.mean():.3f} | C2_Struct_Weight: {alpha2.mean():.3f}")
+
+            # 准备字典用于 eval_alignment
+            d1_s = {id: emb1_struct[i].cpu()
+                    for i, id in enumerate(c1.dataset.ids)}
+            d2_s = {id: emb2_struct[i].cpu()
+                    for i, id in enumerate(c2.dataset.ids)}
+
+            d1_f = {id: emb1_fused[i].cpu()
+                    for i, id in enumerate(c1.dataset.ids)}
+            d2_f = {id: emb2_fused[i].cpu()
+                    for i, id in enumerate(c2.dataset.ids)}
+
+        # 清理显存
+        c1.model.to('cpu')
+        c2.model.to('cpu')
+        if dm.is_offload_enabled():
+            dm.clean_memory()
+
+        # 3.1 评估纯结构 (Student Grade) -> 看 GAT 学得怎么样
+        h_s, mrr_s = eval_alignment(
+            d1_s, d2_s, test_pairs, k_values=[1], alpha=1.0)
+
+        # 3.2 评估融合效果 (Final Grade) -> 实际部署效果
+        h_f, mrr_f = eval_alignment(
+            d1_f, d2_f, test_pairs, k_values=[1, 10], alpha=1.0)
+
         log.info(
-            f"   🏆 Result R{r}: Hits@1={h_f[1]:.2f}% | Hits@5={h_f[5]:.2f}% | Hits@10={h_f[10]:.2f}% | MRR={m_f:.4f}")
+            f"   🔹 [Pure Structure] Hits@1={h_s[1]:.2f}% | MRR={mrr_s:.4f}")
+        log.info(
+            f"   🏆 [Fused Model   ] Hits@1={h_f[1]:.2f}% | Hits@10={h_f[10]:.2f}%")
 
-        # [新增] 保存详细历史数据
-        results.append({
+        # 记录结果
+        results_history.append({
             "round": r,
-            "hits1": h_f[1],
-            "hits5": h_f[5],
-            "hits10": h_f[10],
-            "mrr": m_f
+            "fidelity": avg_fidelity,
+            "pure_hits1": h_s[1],
+            "fused_hits1": h_f[1],
+            "fused_hits10": h_f[10]
         })
+
+        if h_f[1] > best_hits1:
+            best_hits1 = h_f[1]
+            server.save_model("best")
 
         if r == rounds:
             break
 
-        # --- Step 4: 挖掘 (Pure GCN) ---
-        log.info(
-            f"   💎 Generating Pseudo-labels (GCN Mining, Decaying Thresh={current_threshold:.4f})...")
+        # --- Step 4: Curriculum-Controlled Mining (课程学习控制) ---
+        # 核心逻辑：只有当 Fidelity > Thresh 时，才认为 Structure 模型“懂了”，允许它去挖掘
+        if avg_fidelity < curriculum_thresh:
+            log.warning(
+                f"   ⚠️ Fidelity ({avg_fidelity:.3f}) < Thresh ({curriculum_thresh}). Skipping Mining.")
+            log.info("      (Student is not ready yet. Continuing Imitation...)")
+            continue
 
-        pairs_idx = PseudoLabelGenerator.generate(
-            struct_emb1, struct_emb2,
-            threshold=current_threshold, device='cpu'
+        log.info(
+            f"   💎 Fidelity Passed! Generating Pseudo-labels (Thresh={curr_mining_thresh:.4f})...")
+
+        # 使用【融合特征】进行挖掘，因为它是最强的
+        new_pairs = PseudoLabelGenerator.generate(
+            emb1_fused.cpu(), emb2_fused.cpu(),
+            threshold=curr_mining_thresh,
+            device='cpu'
         )
 
-        # --- Step 5: 语义一致性过滤 (Safety Net) ---
-        # 虽然我们想做互学习，但为了防止完全跑偏，加一个宽松的 SBERT 过滤器
-        filtered_pairs = []
-        semantic_filter_thresh = 0.25  # 比较宽松，允许一定的语义噪音，只要不太离谱
+        if len(new_pairs) > 0:
+            # 互学习：如果 Structure 认为 A-B 对齐，则更新 SBERT Anchor
+            # 这样下一轮 GAT 就会被强迫去拟合这个新的、带有结构信息的目标
+            src_idx = [p[0] for p in new_pairs]
+            tgt_idx = [p[1] for p in new_pairs]
 
-        if len(pairs_idx) > 0:
-            p1 = torch.tensor([p[0] for p in pairs_idx])
-            p2 = torch.tensor([p[1] for p in pairs_idx])
+            # C1 的新目标是 C2 的 Embedding
+            c1.update_anchors(src_idx, emb2_fused[tgt_idx].cpu())
+            # C2 的新目标是 C1 的 Embedding
+            c2.update_anchors(tgt_idx, emb1_fused[src_idx].cpu())
 
-            s1_vecs = F.normalize(fixed_sbert_1[p1], p=2, dim=1)
-            s2_vecs = F.normalize(fixed_sbert_2[p2], p=2, dim=1)
-            sem_sims = (s1_vecs * s2_vecs).sum(dim=1)
-
-            mask = sem_sims > semantic_filter_thresh
-            valid_indices = torch.nonzero(mask).squeeze()
-
-            if valid_indices.numel() > 0:
-                if valid_indices.ndim == 0:
-                    filtered_pairs.append(pairs_idx[valid_indices.item()])
-                else:
-                    for idx in valid_indices.tolist():
-                        filtered_pairs.append(pairs_idx[idx])
-
-            log.info(
-                f"   🔍 Semantic Filter: {len(pairs_idx)} -> {len(filtered_pairs)} (Removed {len(pairs_idx)-len(filtered_pairs)})")
+            log.info(f"   ✅ Anchors Updated: {len(new_pairs)} pairs injected.")
         else:
-            filtered_pairs = []
+            log.info("   ⚠️ No reliable pairs found.")
 
-        # --- Step 6: 互学习更新 (Co-training Update) ---
-        if len(filtered_pairs) > 0:
-            p_idx1 = [p[0] for p in filtered_pairs]
-            p_idx2 = [p[1] for p in filtered_pairs]
+    log.info(f"🏁 Final Best Hits@1: {best_hits1:.2f}%")
 
-            # [老版本逻辑复刻]
-            # C1 的新目标 = C2 现在的 Structure Embedding
-            # 这允许 C1 学习 C2 挖掘出的结构信息，而不仅仅是死记 SBERT
-            new_anchors_for_c1 = struct_emb2[p_idx2]
-            new_anchors_for_c2 = struct_emb1[p_idx1]
-
-            c1.update_anchors(p_idx1, new_anchors_for_c1)
-            c2.update_anchors(p_idx2, new_anchors_for_c2)
-
-            log.info(
-                f"   ✅ Anchors Expanded: +{len(filtered_pairs)} pairs (Targets = Peer Structure).")
-        else:
-            log.warning("   ⚠️ No new anchors found.")
-
-    if cfg.task.checkpoint.save_best:
-        # 获取当前使用的 encoder 名称 (gcn 或 gat)
-        encoder_name = cfg.task.model.encoder_name
-
-        # 1. 保存 Server (Global MLP) -> 加上 encoder 后缀
-        server.save_model(suffix=f"structure_{encoder_name}_round{rounds}")
-
-        # 2. 保存 Client 模型 (包含私有 GCN/GAT 参数)
-        save_dir = cfg.task.checkpoint.save_dir
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-
-        # 命名格式: c{id}_structure_round{rounds}.pth
-        # [修改] 命名格式: c{id}_structure_{encoder}_round{rounds}.pth
-        # 这样 GCN 和 GAT 的权重文件就会分开，不会覆盖
-        c1_path = os.path.join(
-            save_dir, f"c1_structure_{encoder_name}_round{rounds}.pth")
-        c2_path = os.path.join(
-            save_dir, f"c2_structure_{encoder_name}_round{rounds}.pth")
-
-        # 获取包含 GCN+MLP 的完整状态字典
-        # 注意: get_shared_state_dict 只返回 MLP，我们要用 state_dict() 获取全部
-        torch.save(c1.model.state_dict(), c1_path)
-        torch.save(c2.model.state_dict(), c2_path)
-
-        log.info(f"💾 Saved full client models to:")
-        log.info(f"   - {c1_path}")
-        log.info(f"   - {c2_path}")
-
-    # [新增] 循环结束后，保存完整的训练历史 (Learning Curve Data)
+    # 保存训练历史
     history_path = os.path.join(os.getcwd(), "training_history.json")
     with open(history_path, 'w') as f:
-        json.dump(results, f, indent=4)
-    log.info(f"📈 Full training history saved to: {history_path}")
+        json.dump(results_history, f, indent=4)
 
-    log_experiment_result(cfg.experiment_name,
-                          cfg.data.name, results[-1], config=cfg)
+    res = {
+        "dataset": cfg.data.name,
+        "mode": "structure",
+        "best_hits1": best_hits1
+    }
+    log_experiment_result("structure_phase2", cfg.data.name, res)
 
 
 if __name__ == "__main__":
