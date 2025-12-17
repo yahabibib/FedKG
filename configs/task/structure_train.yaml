@@ -6,12 +6,11 @@ strategy:
   text_mode: "structure_phase2"
   pseudo_threshold: 0.95
 
-# Phase 1 训练好的 SBERT 路径
 sbert_checkpoint: "checkpoints/sbert_mixed_round5"
 
 model:
   name: "decoupled_model"
-  encoder_name: "gat"  # [修改] 切换为 GAT！
+  encoder_name: "gat"   # 保持 GAT
   gcn_dim: 300
   gcn_hidden: 600
   dropout: 0.3
@@ -19,9 +18,15 @@ model:
 federated:
   rounds: 10
   local_epochs: 100
-  batch_size: 512
+  batch_size: 512       # 大 Batch 适配 InfoNCE
   lr: 5e-4
-  margin: 0.4
+  
+  # [优化机制]
+  temperature: 0.07     # InfoNCE 温度
+  
+  # [新增] 课程学习阈值
+  # 只有当 Structure 和 SBERT 的本地余弦相似度 > 0.7 时，才开启伪标签挖掘
+  curriculum_thresh: 0.70 
 
 eval:
   alpha: 0.42
