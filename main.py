@@ -13,6 +13,7 @@ from src.data.dataset import AlignmentTaskData
 from src.utils.device_manager import DeviceManager
 from src.utils.metrics import eval_alignment
 from src.utils.logger import log_experiment_result
+from src.utils.tuning import search_best_alpha
 
 # --- 联邦组件 ---
 from src.federation.server import Server
@@ -166,48 +167,63 @@ def run_sbert_workflow(cfg, server, c1, c2, test_pairs, dm):
 
 def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
     """
-    Phase 2: Structure Alignment Workflow
-    (Performance-Aware Curriculum Federation)
+    Phase 2: Structure Alignment Workflow (Biased Adaptive Mining)
+
+    机制说明：
+    1. 成熟度检查 (Maturity Check): 结构模型性能需达到 Baseline 的 75% 才允许介入。
+    2. 结构偏置 (Structural Bias): 在 Gate 自动判断的基础上，初期强制注入 +0.2 的偏置，
+       随着轮次增加衰减至 0.0。
+    3. 互学习 (Mutual Learning): 使用“加权融合”后的特征生成伪标签并更新 Anchor。
     """
     rounds = cfg.task.federated.rounds
-    # 读取课程学习阈值，默认 0.70
     curriculum_thresh = cfg.task.federated.get('curriculum_thresh', 0.70)
 
-    # 挖掘阈值衰减策略
+    # --- [配置] 结构偏置衰减计划 (Bias Schedule) ---
+    # 刚开始成熟时推一把 (+0.2)，后期让 Gate 自己做主 (+0.0)
+    bias_start = 0.2
+    bias_end = 0.0
+    bias_step = (bias_start - bias_end) / max(1, rounds - 1)
+
+    # --- [配置] 挖掘阈值衰减 ---
     thresh_start = 0.85
     thresh_end = 0.60
     thresh_step = (thresh_start - thresh_end) / max(1, rounds - 1)
 
-    best_hits1 = 0.0
+    best_global_hits1 = 0.0
     results_history = []
 
     # ---------------------------------------------------------
-    # 0. 初始基准评估 (SBERT Baseline)
+    # 0. SBERT Baseline (基准线)
     # ---------------------------------------------------------
     log.info("\n" + "="*60)
-    log.info("📊 Baseline Evaluation: SBERT (Before Structure Training)")
+    log.info("📊 Baseline Evaluation: SBERT")
     log.info("="*60)
 
     # 获取纯 SBERT 特征
     s1_base = F.normalize(c1.anchor_embeddings, p=2, dim=1)
     s2_base = F.normalize(c2.anchor_embeddings, p=2, dim=1)
-
     d1_base = {id: s1_base[i] for i, id in enumerate(c1.dataset.ids)}
     d2_base = {id: s2_base[i] for i, id in enumerate(c2.dataset.ids)}
 
-    # alpha=0.0 代表纯 SBERT 评估
+    # 计算基准分数
     h_base, mrr_base = eval_alignment(
         d1_base, d2_base, test_pairs, k_values=[1], alpha=0.0)
-    log.info(f"🏆 SBERT Baseline: Hits@1={h_base[1]:.2f}% | MRR={mrr_base:.4f}")
-    log.info("   (Target: Structure model should try to match this fidelity first!)\n")
+    BASELINE_HITS1 = h_base[1]
+
+    # 设定成熟度门槛 (75% of Baseline)
+    MATURITY_TARGET = BASELINE_HITS1 * 0.75
+
+    log.info(f"🏆 SBERT Baseline Hits@1: {BASELINE_HITS1:.2f}%")
+    log.info(
+        f"🎯 Maturity Target: {MATURITY_TARGET:.2f}% (Wait until Structure hits this)")
 
     # ---------------------------------------------------------
     # 联邦训练循环
     # ---------------------------------------------------------
     for r in range(rounds + 1):
-        # 计算当前挖掘阈值
+        # 计算当前轮次的超参
         curr_mining_thresh = max(thresh_end, thresh_start - (r * thresh_step))
-        # 动态 Epochs: Round 0 需要多跑一会来热身
+        curr_bias = max(bias_end, bias_start - (r * bias_step))
         curr_epochs = 100 if r == 0 else cfg.task.federated.local_epochs
 
         log.info(f"\n{'='*40}")
@@ -215,148 +231,163 @@ def run_structure_workflow(cfg, server, c1, c2, test_pairs, dm):
         log.info(f"{'='*40}")
 
         # --- Step 1: Local Training ---
-        log.info(
-            f"🚀 Training {cfg.task.model.encoder_name.upper()} (Target=SBERT/Peer)...")
-
-        # 接收: 权重, Loss, 以及 [Internal Fidelity]
+        # 始终通过 InfoNCE 拟合当前的目标 (SBERT 或 Updated Anchors)
         w1, l1, fid1 = c1.train(custom_epochs=curr_epochs)
         w2, l2, fid2 = c2.train(custom_epochs=curr_epochs)
 
         avg_fidelity = (fid1 + fid2) / 2
-        log.info(f"   📉 Loss: C1={l1:.4f} | C2={l2:.4f}")
         log.info(
-            f"   🎓 Internal Fidelity: C1={fid1:.3f} | C2={fid2:.3f} | Avg={avg_fidelity:.3f}")
-        log.info(f"      (Curriculum Threshold: {curriculum_thresh})")
+            f"   📉 Loss: C1={l1:.4f} | C2={l2:.4f} | Fidelity: {avg_fidelity:.3f}")
 
         # --- Step 2: Aggregation ---
-        # log.info("🔗 Aggregating Shared Weights...")
         server.aggregate([w1, w2])
-        global_weights = server.get_global_weights()
+        weights = server.get_global_weights()
+        c1.model.load_shared_state_dict(weights)
+        c2.model.load_shared_state_dict(weights)
 
-        # 分发更新
-        c1.model.load_shared_state_dict(global_weights)
-        c2.model.load_shared_state_dict(global_weights)
-
-        # --- Step 3: Dual Evaluation (双重评估) ---
-        log.info(f"📊 Round {r} Evaluation...")
-
-        c1.model.to(c1.device).eval()
-        c2.model.to(c2.device).eval()
-
-        with torch.no_grad():
-            # A. 获取纯结构特征 (Pure Structure)
-            emb1_struct = F.normalize(
-                c1.model(c1.adj, c1.edge_types), p=2, dim=1)
-            emb2_struct = F.normalize(
-                c2.model(c2.adj, c2.edge_types), p=2, dim=1)
-
-            # B. 获取 SBERT 特征 (Anchors)
-            emb1_sbert = F.normalize(
-                c1.anchor_embeddings.to(c1.device), p=2, dim=1)
-            emb2_sbert = F.normalize(
-                c2.anchor_embeddings.to(c2.device), p=2, dim=1)
-
-            # C. 融合特征 (Gate 辅助推理)
-            # 只有在推理时才进行融合！
-            emb1_fused, alpha1 = c1.model.fuse(emb1_struct, emb1_sbert)
-            emb2_fused, alpha2 = c2.model.fuse(emb2_struct, emb2_sbert)
-
-            # 打印 Gate 的倾向性
-            log.info(
-                f"      [Gate Stats] C1_Struct_Weight: {alpha1.mean():.3f} | C2_Struct_Weight: {alpha2.mean():.3f}")
-
-            # 准备字典用于 eval_alignment
-            d1_s = {id: emb1_struct[i].cpu()
-                    for i, id in enumerate(c1.dataset.ids)}
-            d2_s = {id: emb2_struct[i].cpu()
-                    for i, id in enumerate(c2.dataset.ids)}
-
-            d1_f = {id: emb1_fused[i].cpu()
-                    for i, id in enumerate(c1.dataset.ids)}
-            d2_f = {id: emb2_fused[i].cpu()
-                    for i, id in enumerate(c2.dataset.ids)}
-
-        # 清理显存
-        c1.model.to('cpu')
-        c2.model.to('cpu')
+        # --- Step 3: Maturity Check (成熟度检查) ---
+        log.info(f"📊 Round {r} Evaluation & Mining Check...")
         if dm.is_offload_enabled():
             dm.clean_memory()
 
-        # 3.1 评估纯结构 (Student Grade) -> 看 GAT 学得怎么样
-        h_s, mrr_s = eval_alignment(
+        c1.model.eval()
+        c2.model.eval()
+        with torch.no_grad():
+            # 获取纯结构特征 (Pure Structure)
+            e1_s = F.normalize(
+                c1.model(c1.adj, c1.edge_types), p=2, dim=1).cpu()
+            e2_s = F.normalize(
+                c2.model(c2.adj, c2.edge_types), p=2, dim=1).cpu()
+
+        d1_s = {id: e1_s[i] for i, id in enumerate(c1.dataset.ids)}
+        d2_s = {id: e2_s[i] for i, id in enumerate(c2.dataset.ids)}
+
+        h_pure, _ = eval_alignment(
             d1_s, d2_s, test_pairs, k_values=[1], alpha=1.0)
+        pure_hits1 = h_pure[1]
 
-        # 3.2 评估融合效果 (Final Grade) -> 实际部署效果
-        h_f, mrr_f = eval_alignment(
-            d1_f, d2_f, test_pairs, k_values=[1, 10], alpha=1.0)
-
+        is_mature = pure_hits1 >= MATURITY_TARGET
         log.info(
-            f"   🔹 [Pure Structure] Hits@1={h_s[1]:.2f}% | MRR={mrr_s:.4f}")
-        log.info(
-            f"   🏆 [Fused Model   ] Hits@1={h_f[1]:.2f}% | Hits@10={h_f[10]:.2f}%")
+            f"   🎓 Pure Structure Hits@1: {pure_hits1:.2f}% (Target: {MATURITY_TARGET:.2f}%)")
 
-        # 记录结果
+        # --- Step 4: Biased Adaptive Mining (核心机制) ---
+        final_hits1 = 0.0
+
+        if not is_mature:
+            # === Mode A: Warm-up (预热期) ===
+            log.info("   🔒 Status: WARM-UP MODE")
+            log.info(
+                "      Structure is too weak. Skipping mining to let it fit SBERT perfectly.")
+            # 此时我们不做任何挖掘，也不更新 Anchor，让 GCN 专心拟合初始 SBERT
+            # 用纯结构分数记录即可
+            final_hits1 = pure_hits1
+
+        else:
+            # === Mode B: Adaptive Fusion (自适应融合期) ===
+            log.info(f"   🔓 Status: ADAPTIVE MINING (Bias={curr_bias:.2f})")
+
+            c1.model.eval()
+            c2.model.eval()
+
+            with torch.no_grad():
+                # 1. 准备语义特征 (CPU)
+                e1_t = c1.anchor_embeddings.cpu()
+                e2_t = c2.anchor_embeddings.cpu()
+
+                # 2. 手动执行带偏置的融合 (Manual Biased Fusion)
+                # -------------------------------------------------
+                # C1 Fusion
+                # 获取 Gate 的原始输出 (Alpha)
+                # 注意：这里需要临时构建 Gate 的输入 [struct, sbert]
+                gate_inp_c1 = torch.cat([e1_s, e1_t], dim=1)
+                # 调用模型内的 gate 子模块
+                raw_alpha_c1 = c1.model.gate.to('cpu')(gate_inp_c1)  # [N, 1]
+
+                # 注入偏置并截断 (Clamp)
+                boosted_alpha_c1 = torch.clamp(
+                    raw_alpha_c1 + curr_bias, 0.0, 1.0)
+
+                # 加权融合
+                e1_fused = F.normalize(
+                    boosted_alpha_c1 * e1_s + (1 - boosted_alpha_c1) * e1_t, p=2, dim=1)
+
+                # C2 Fusion (同理)
+                gate_inp_c2 = torch.cat([e2_s, e2_t], dim=1)
+                raw_alpha_c2 = c2.model.gate.to('cpu')(gate_inp_c2)
+                boosted_alpha_c2 = torch.clamp(
+                    raw_alpha_c2 + curr_bias, 0.0, 1.0)
+                e2_fused = F.normalize(
+                    boosted_alpha_c2 * e2_s + (1 - boosted_alpha_c2) * e2_t, p=2, dim=1)
+                # -------------------------------------------------
+
+                log.info(
+                    f"   📊 Gate Stats (C1): Raw_Mean={raw_alpha_c1.mean():.3f} | Boosted_Mean={boosted_alpha_c1.mean():.3f}")
+
+                # 3. 评估融合后的效果 (Adaptive Evaluation)
+                d1_f = {id: e1_fused[i] for i, id in enumerate(c1.dataset.ids)}
+                d2_f = {id: e2_fused[i] for i, id in enumerate(c2.dataset.ids)}
+                # alpha=1.0 因为 d1_f 已经是融合好的向量了
+                h_f, _ = eval_alignment(
+                    d1_f, d2_f, test_pairs, k_values=[1], alpha=1.0)
+                final_hits1 = h_f[1]
+
+                log.info(f"   🏆 Adaptive Hits@1: {final_hits1:.2f}%")
+
+                # 4. 执行挖掘 (Mining)
+                # 使用融合特征计算互为最近邻
+                new_pairs = PseudoLabelGenerator.generate(
+                    e1_fused, e2_fused,
+                    threshold=curr_mining_thresh,
+                    device='cpu'
+                )
+
+                # 5. 更新 Anchors (Update Targets)
+                if len(new_pairs) > 0:
+                    src_idx = [p[0] for p in new_pairs]
+                    tgt_idx = [p[1] for p in new_pairs]
+
+                    # 交叉更新：用对方融合后的特征作为我下一轮训练的目标
+                    c1.update_anchors(src_idx, e2_fused[tgt_idx])
+                    c2.update_anchors(tgt_idx, e1_fused[src_idx])
+
+                    log.info(
+                        f"   ✅ Anchors Updated: {len(new_pairs)} pairs (Injecting Structure Info).")
+                else:
+                    log.info("   ⚠️ No reliable pairs found.")
+
+        # 保存最佳模型
+        if final_hits1 > best_global_hits1:
+            best_global_hits1 = final_hits1
+            server.save_model("best_structure")
+
+        # 记录历史
         results_history.append({
             "round": r,
-            "fidelity": avg_fidelity,
-            "pure_hits1": h_s[1],
-            "fused_hits1": h_f[1],
-            "fused_hits10": h_f[10]
+            "mode": "Fusion" if is_mature else "Warm-up",
+            "bias": curr_bias if is_mature else 0.0,
+            "hits1": final_hits1
         })
-
-        if h_f[1] > best_hits1:
-            best_hits1 = h_f[1]
-            server.save_model("best")
 
         if r == rounds:
             break
 
-        # --- Step 4: Curriculum-Controlled Mining (课程学习控制) ---
-        # 核心逻辑：只有当 Fidelity > Thresh 时，才认为 Structure 模型“懂了”，允许它去挖掘
-        if avg_fidelity < curriculum_thresh:
-            log.warning(
-                f"   ⚠️ Fidelity ({avg_fidelity:.3f}) < Thresh ({curriculum_thresh}). Skipping Mining.")
-            log.info("      (Student is not ready yet. Continuing Imitation...)")
-            continue
+    log.info(f"🏁 Final Best Hits@1: {best_global_hits1:.2f}%")
 
-        log.info(
-            f"   💎 Fidelity Passed! Generating Pseudo-labels (Thresh={curr_mining_thresh:.4f})...")
-
-        # 使用【融合特征】进行挖掘，因为它是最强的
-        new_pairs = PseudoLabelGenerator.generate(
-            emb1_fused.cpu(), emb2_fused.cpu(),
-            threshold=curr_mining_thresh,
-            device='cpu'
-        )
-
-        if len(new_pairs) > 0:
-            # 互学习：如果 Structure 认为 A-B 对齐，则更新 SBERT Anchor
-            # 这样下一轮 GAT 就会被强迫去拟合这个新的、带有结构信息的目标
-            src_idx = [p[0] for p in new_pairs]
-            tgt_idx = [p[1] for p in new_pairs]
-
-            # C1 的新目标是 C2 的 Embedding
-            c1.update_anchors(src_idx, emb2_fused[tgt_idx].cpu())
-            # C2 的新目标是 C1 的 Embedding
-            c2.update_anchors(tgt_idx, emb1_fused[src_idx].cpu())
-
-            log.info(f"   ✅ Anchors Updated: {len(new_pairs)} pairs injected.")
-        else:
-            log.info("   ⚠️ No reliable pairs found.")
-
-    log.info(f"🏁 Final Best Hits@1: {best_hits1:.2f}%")
-
-    # 保存训练历史
+    # 保存训练日志到文件
+    import json
+    import os
     history_path = os.path.join(os.getcwd(), "training_history.json")
     with open(history_path, 'w') as f:
         json.dump(results_history, f, indent=4)
 
+    # 记录到实验汇总
+    from src.utils.logger import log_experiment_result
     res = {
         "dataset": cfg.data.name,
-        "mode": "structure",
-        "best_hits1": best_hits1
+        "mode": "biased_adaptive_mining",
+        "best_hits1": best_global_hits1
     }
-    log_experiment_result("structure_phase2", cfg.data.name, res)
+    log_experiment_result("structure_final", cfg.data.name, res)
 
 
 if __name__ == "__main__":
